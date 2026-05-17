@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>RefBoard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- Titlebar -->
+<div id="titlebar">
+  <div id="tb-left">
+    <button class="tb-btn" id="btn-new" title="New Project Ctrl+N">New</button>
+    <button class="tb-btn" id="btn-open" title="Open Project Ctrl+O">Open</button>
+    <button class="tb-btn" id="btn-save" title="Save Ctrl+S">Save</button>
+    <button class="tb-btn save-as" id="btn-saveas" title="Save As Ctrl+Shift+S">Save As</button>
+  </div>
+  <div id="tb-center">
+    <span id="project-name">Untitled</span>
+  </div>
+  <div id="tb-right">
+    <button id="btn-min" class="win-btn">&#x2015;</button>
+    <button id="btn-max" class="win-btn">&#x25A1;</button>
+    <button id="btn-close" class="win-btn close-btn">&#x2715;</button>
+  </div>
+</div>
+
+<!-- App body -->
+<div id="app-body">
+
+  <!-- LEFT sidebar -->
+  <div id="sidebar">
+    <div id="sb-head">
+      <span class="pane-label">Library</span>
+    </div>
+    <div id="folder-tree"></div>
+  </div>
+
+  <!-- MEDIA thumbnail list -->
+  <div id="media-panel" class="hidden">
+    <div id="mp-head">
+      <span id="page-title-label" class="pane-label">Page</span>
+    </div>
+    <div id="media-list"></div>
+  </div>
+
+  <!-- VIEWER -->
+  <div id="viewer-wrap">
+    <div id="viewer-empty">
+      <svg class="empty-icon" viewBox="0 0 72 72" fill="none" stroke="currentColor" stroke-width="1.2">
+        <rect x="6" y="14" width="60" height="44" rx="4"/>
+        <circle cx="24" cy="30" r="6"/>
+        <path d="M6 44l18-13 12 9 10-7 20 13" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <p class="empty-title">Select a reference</p>
+      <p class="empty-sub">Create a folder, add a page, import media<br><strong>or drag & drop files here</strong></p>
+    </div>
+    <div id="viewer-stage" class="hidden">
+      <canvas id="gif-canvas" class="hidden"></canvas>
+      <img id="img-viewer" class="hidden" draggable="false">
+      <video id="vid-viewer" class="hidden" loop></video>
+    </div>
+    
+    <!-- Zoom HUD -->
+    <div id="zoom-hud">
+      <button class="zh-btn" id="z-out" title="Zoom out">−</button>
+      <span id="zoom-pct">100%</span>
+      <button class="zh-btn" id="z-in" title="Zoom in">+</button>
+      <div class="zh-divider"></div>
+      <button class="zh-btn" id="z-fit" title="Fit to screen (F)">Fit</button>
+    </div>
+  </div>
+
+  <!-- RIGHT info panel -->
+  <div id="info-panel" class="hidden">
+    <div id="ip-head">
+      <span class="pane-label">Properties</span>
+    </div>
+    <div id="ip-body">
+      <label class="field-label">Title</label>
+      <input id="inp-title" type="text" placeholder="Untitled reference" spellcheck="false" autocomplete="off">
+
+      <label class="field-label">Description</label>
+      <textarea id="inp-desc" placeholder="What is this? Where is it from?"></textarea>
+
+      <label class="field-label">Notes</label>
+      <textarea id="inp-notes" placeholder="Color palette, timing, what makes it work..."></textarea>
+
+      <div id="media-meta"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- PLAYBACK BAR -->
+<div id="playback-bar" class="hidden">
+
+  <!-- Timeline -->
+  <div id="timeline-row">
+    <span id="t-current" class="t-time">0:00</span>
+    <div id="timeline-track">
+      <div id="tl-bg"></div>
+      <div id="tl-fill"></div>
+      <div id="tl-thumb"></div>
+    </div>
+    <span id="t-total" class="t-time">0:00</span>
+  </div>
+
+  <!-- Controls -->
+  <div id="pb-controls-row">
+    <div id="pb-left">
+      <button class="pb-btn" id="pb-prev" title="Prev frame / −1s">
+        <svg viewBox="0 0 20 20" fill="currentColor" width="20" height="20">
+          <path d="M5 4h2.5v12H5V4zm3.5 6L17 5v10L8.5 10z"/>
+        </svg>
+      </button>
+      <button class="pb-btn play-btn" id="pb-play" title="Play / Pause (Space)">
+        <svg id="icon-play" viewBox="0 0 20 20" fill="currentColor" width="22" height="22"><path d="M6 4l12 6-12 6V4z"/></svg>
+        <svg id="icon-pause" class="hidden" viewBox="0 0 20 20" fill="currentColor" width="22" height="22">
+          <rect x="4" y="3" width="4" height="14" rx="1"/><rect x="12" y="3" width="4" height="14" rx="1"/>
+        </svg>
+      </button>
+      <button class="pb-btn" id="pb-next" title="Next frame / +1s">
+        <svg viewBox="0 0 20 20" fill="currentColor" width="20" height="20">
+          <path d="M12.5 4H15v12h-2.5V4zM11.5 10L3 5v10l8.5-5z"/>
+        </svg>
+      </button>
+      <span id="frame-display">—</span>
+      
+      <!-- Mode toggle -->
+      <button class="mode-btn" id="btn-mode" title="Toggle Mode (M)">▶ Playback</button>
+    </div>
+
+    <div id="pb-center">
+      <span class="pb-label">Speed</span>
+      <div id="speed-btns">
+        <button class="spd" data-v="0.1">0.1×</button>
+        <button class="spd" data-v="0.25">¼×</button>
+        <button class="spd" data-v="0.5">½×</button>
+        <button class="spd active" data-v="1">1×</button>
+        <button class="spd" data-v="2">2×</button>
+      </div>
+    </div>
+
+    <div id="pb-right">
+      <button class="pb-btn" id="btn-mute" title="Mute">
+        <svg id="icon-vol" viewBox="0 0 20 20" fill="currentColor" width="20" height="20">
+          <path d="M9.5 4L5.5 7H2.5v6h3l4 3V4z"/>
+          <path d="M13 7.5a4 4 0 010 5" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+          <path d="M15.5 5a7 7 0 010 10" stroke="currentColor" stroke-width="1.5" fill="none" stroke-linecap="round"/>
+        </svg>
+        <svg id="icon-mute" class="hidden" viewBox="0 0 20 20" fill="currentColor" width="20" height="20">
+          <path d="M9.5 4L5.5 7H2.5v6h3l4 3V4z"/>
+          <path d="M14 8l3 3m0-3l-3 3" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round"/>
+        </svg>
+      </button>
+      <input id="vol-slider" type="range" min="0" max="100" value="100" title="Volume">
+    </div>
+  </div>
+</div>
+
+<!-- Modal -->
+<div id="modal-bg" class="hidden">
+  <div id="modal-box">
+    <div id="modal-title">New Folder</div>
+    <input id="modal-inp" type="text" spellcheck="false" autocomplete="off">
+    <div id="modal-actions">
+      <button class="mb-btn" id="modal-cancel">Cancel</button>
+      <button class="mb-btn accent" id="modal-ok">Create</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<!-- Loading overlay -->
+<div id="loading-overlay" class="hidden">
+  <div class="loading-content">
+    <div class="loading-spinner"></div>
+    <div class="loading-text">Loading...</div>
+    <div class="loading-progress">
+      <div class="loading-progress-bar"></div>
+    </div>
+  </div>
+</div>
+
+<script src="renderer.js"></script>
+</body>
+</html>
