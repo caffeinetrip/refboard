@@ -1,7 +1,7 @@
 {
   "name": "refboard",
   "version": "1.0.0",
-  "description": "Visual Reference Board for artists",
+  "description": "Minimal game reference library",
   "main": "main.js",
   "scripts": {
     "start": "electron .",

@@ -3,8 +3,10 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
+let mainWindow = null;
+
 function createWindow() {
-  const win = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
     minWidth: 1000,
@@ -17,11 +19,17 @@ function createWindow() {
       webSecurity: false,
     },
   });
-  win.loadFile('index.html');
+  mainWindow.loadFile('index.html');
+  mainWindow.on('closed', () => { mainWindow = null; });
 }
 
 app.whenReady().then(createWindow);
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+});
 
 // ── IPC handlers ──────────────────────────────────────────────────────────────
 ipcMain.handle('dialog:open', async (_, options) => {

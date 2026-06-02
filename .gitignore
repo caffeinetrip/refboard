@@ -1,8 +1,14 @@
+
 node_modules/
+
 dist/
+out/
 build/
-.vite/
+
+npm-debug.log
+yarn-error.log
+
 .env
-.env.local
+
 .DS_Store
-*.log
+Thumbs.db
