@@ -1,6 +1,6 @@
 'use strict';
 
-const { ipcRenderer } = require('electron');
+const { ipcRenderer, clipboard } = require('electron');
 const nodePath = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -16,7 +16,7 @@ try {
   decompressFrames = null;
 }
 
-const APP_VERSION = 3;
+const APP_VERSION = 6;
 const APP_TYPE = 'game-analysis-library';
 
 const $ = id => document.getElementById(id);
@@ -143,19 +143,26 @@ let toastTimer = null;
 let modalCb = null;
 let importanceMenuCloseHandler = null;
 let milestoneMenuCloseHandler = null;
+let categoryMenuCloseHandler = null;
+let lastScrollState = [];
+let scrollRestoreTimer = null;
+let navStack = [];
+let restoringRoute = false;
 
 function getActiveGame() {
   return S.games.find(g => g.id === S.activeGameId) || null;
 }
 
 function getMediaById(id) {
-  return S.media.find(m => m.id === id) || null;
+  const media = S.media.find(m => m.id === id) || null;
+  return media ? ensureMediaShape(media) : null;
 }
 
 function getGameMedia(gameId, kind) {
   return S.media
-    .filter(m => m.gameId === gameId && (!kind || m.kind === kind))
-    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    .map(ensureMediaShape)
+    .filter(m => m.gameId === gameId && (!kind || m.kind === kind) && m.scope === 'game')
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
 }
 
 function getActiveDailyNote() {
@@ -203,6 +210,75 @@ function importanceLevel(value) {
   return IMPORTANCE_LEVELS.find(level => level.id === value) || IMPORTANCE_LEVELS[0];
 }
 
+function importanceRank(value) {
+  return IMPORTANCE_LEVELS.findIndex(level => level.id === importanceLevel(value).id);
+}
+
+function sortByImportance(items) {
+  items.sort((a, b) => importanceRank(b.importance) - importanceRank(a.importance) || String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')));
+}
+
+const SCROLL_KEEP_SELECTORS = [
+  '.screen-scroll',
+  '.tab-scroll',
+  '.day-scroll',
+  '.album-scroll',
+  '.media-list',
+  '.project-media-grid',
+  '.masonry-grid',
+  '.kanban-columns',
+  '.task-list',
+];
+
+function scrollKeyFor(el, selector, index) {
+  return el.id ? `#${el.id}` : `${selector}:${index}`;
+}
+
+function captureScrollState() {
+  const seen = new Set();
+  const state = [];
+  SCROLL_KEEP_SELECTORS.forEach(selector => {
+    document.querySelectorAll(selector).forEach((el, index) => {
+      if (seen.has(el)) return;
+      seen.add(el);
+      state.push({
+        key: scrollKeyFor(el, selector, index),
+        top: el.scrollTop,
+        left: el.scrollLeft,
+      });
+    });
+  });
+  return state;
+}
+
+function restoreScrollState(state) {
+  if (!Array.isArray(state) || !state.length) return;
+  SCROLL_KEEP_SELECTORS.forEach(selector => {
+    document.querySelectorAll(selector).forEach((el, index) => {
+      const key = scrollKeyFor(el, selector, index);
+      const saved = state.find(item => item.key === key);
+      if (!saved) return;
+      el.scrollTop = saved.top;
+      el.scrollLeft = saved.left;
+    });
+  });
+}
+
+function rememberScrollState() {
+  lastScrollState = captureScrollState();
+}
+
+function scheduleScrollRestore() {
+  const state = lastScrollState.length ? lastScrollState : captureScrollState();
+  if (scrollRestoreTimer) cancelAnimationFrame(scrollRestoreTimer);
+  scrollRestoreTimer = requestAnimationFrame(() => {
+    scrollRestoreTimer = requestAnimationFrame(() => {
+      restoreScrollState(state);
+      scrollRestoreTimer = null;
+    });
+  });
+}
+
 function importanceOptions(value) {
   const active = importanceLevel(value).id;
   return IMPORTANCE_LEVELS
@@ -212,7 +288,7 @@ function importanceOptions(value) {
 
 function importanceBadgeHTML(value) {
   const level = importanceLevel(value);
-  return `<span class="rarity-badge rarity-${esc(level.id)}">${esc(level.short)}</span>`;
+  return `<button type="button" class="rarity-badge rarity-${esc(level.id)}" title="Importance: ${esc(level.label)}">${esc(level.short)}</button>`;
 }
 
 function importanceMenuButtonHTML(value) {
@@ -220,8 +296,32 @@ function importanceMenuButtonHTML(value) {
   return `<button class="kebab-btn" title="Importance: ${esc(level.label)}">...</button>`;
 }
 
+function bindImportanceTriggers(root, value, onPick) {
+  if (!root) return;
+  root.querySelectorAll('.rarity-badge, .kebab-btn').forEach(btn => {
+    btn.onclick = e => {
+      e.stopPropagation();
+      openImportanceMenu(e.currentTarget, typeof value === 'function' ? value() : value, onPick);
+    };
+  });
+}
+
+function hasDragType(e, type) {
+  return Array.from(e.dataTransfer?.types || []).includes(type);
+}
+
+function hasMoveDragType(e, type) {
+  return hasDragType(e, type) || hasDragType(e, 'text/plain');
+}
+
+function getDraggedId(e, type) {
+  return e.dataTransfer?.getData(type) || e.dataTransfer?.getData('text/plain') || '';
+}
+
 function openImportanceMenu(anchor, value, onPick) {
   closeImportanceMenu();
+  closeCategoryMenu();
+  closeMilestoneMenu();
   const menu = document.createElement('div');
   menu.id = 'importance-menu';
   menu.className = 'importance-menu';
@@ -259,6 +359,8 @@ function closeImportanceMenu() {
 
 function openMilestoneMenu(anchor, project) {
   closeMilestoneMenu();
+  closeImportanceMenu();
+  closeCategoryMenu();
   const current = getActiveMilestone(project);
   const menu = document.createElement('div');
   menu.id = 'milestone-menu';
@@ -302,6 +404,49 @@ function closeMilestoneMenu() {
   if (menu) menu.remove();
 }
 
+function openCategoryMenu(anchor, categories, activeId, onPick, options = {}) {
+  closeCategoryMenu();
+  closeImportanceMenu();
+  closeMilestoneMenu();
+  const menu = document.createElement('div');
+  menu.id = 'category-menu';
+  menu.className = 'category-menu';
+  const title = options.title || 'Categories';
+  menu.innerHTML = `
+    <div class="category-menu-title">${esc(title)}</div>
+    ${categories.map(category => `
+      <button class="category-choice ${sameId(category.id, activeId) ? 'active' : ''}" data-category="${esc(category.id)}">
+        <span>${esc(category.title)}</span>
+        ${typeof options.countFor === 'function' ? `<small>${options.countFor(category)}</small>` : ''}
+      </button>`).join('')}`;
+  document.body.appendChild(menu);
+  const rect = anchor.getBoundingClientRect();
+  menu.style.top = Math.min(window.innerHeight - menu.offsetHeight - 8, rect.bottom + 6) + 'px';
+  menu.style.left = Math.max(8, Math.min(window.innerWidth - menu.offsetWidth - 8, rect.left)) + 'px';
+  menu.querySelectorAll('[data-category]').forEach(btn => {
+    btn.onclick = e => {
+      e.stopPropagation();
+      const category = categories.find(item => sameId(item.id, btn.dataset.category));
+      if (category) onPick(category);
+      closeCategoryMenu();
+    };
+  });
+  categoryMenuCloseHandler = e => {
+    if (menu.contains(e.target) || anchor.contains(e.target)) return;
+    closeCategoryMenu();
+  };
+  setTimeout(() => document.addEventListener('mousedown', categoryMenuCloseHandler), 0);
+}
+
+function closeCategoryMenu() {
+  if (categoryMenuCloseHandler) {
+    document.removeEventListener('mousedown', categoryMenuCloseHandler);
+    categoryMenuCloseHandler = null;
+  }
+  const menu = $('category-menu');
+  if (menu) menu.remove();
+}
+
 function createTextBlock(text = '') {
   return {
     id: uid(),
@@ -309,18 +454,26 @@ function createTextBlock(text = '') {
     title: 'Text',
     text,
     importance: 'common',
+    height: 180,
+    categoryId: 'blockcat_default',
     createdAt: now(),
     updatedAt: now(),
   };
 }
 
+function sameId(a, b) {
+  return String(a ?? '') === String(b ?? '');
+}
+
 function ensureBlockShape(block) {
-  block.id ??= uid();
+  block.id = String(block.id ?? uid());
   block.type ??= 'text';
   block.title ??= block.type === 'text' ? 'Text' : '';
   block.text ??= '';
   block.caption ??= '';
   block.importance = importanceLevel(block.importance).id;
+  block.categoryId = String(block.categoryId ?? 'blockcat_default');
+  block.height = Math.max(120, Math.min(900, Number(block.height || (block.type === 'media' ? 270 : 180))));
   block.createdAt ??= now();
   block.updatedAt ??= now();
   return block;
@@ -331,8 +484,7 @@ function ensureDailyNoteShape(note) {
   note.date ??= todayISO();
   note.title ??= formatDateTitle(note.date);
   note.importance = importanceLevel(note.importance).id;
-  note.blocks ??= [];
-  note.blocks = Array.isArray(note.blocks) ? note.blocks.map(ensureBlockShape) : [];
+  ensureBlockContainerShape(note);
   note.createdAt ??= now();
   note.updatedAt ??= now();
   return note;
@@ -405,6 +557,7 @@ function ensureMilestoneShape(milestone) {
   milestone.id ??= 'ms_' + uid();
   milestone.title ??= 'Milestone';
   milestone.notes ??= '';
+  milestone.celebratedAt ??= null;
   milestone.boards = Array.isArray(milestone.boards) && milestone.boards.length
     ? milestone.boards.map(ensureKanbanBoardShape)
     : [createKanbanBoard('Ideas')];
@@ -419,9 +572,11 @@ function ensureProjectShape(project) {
   project.title ??= 'Project';
   project.description ??= '';
   project.doc ??= { blocks: [] };
-  project.doc.blocks = Array.isArray(project.doc.blocks) ? project.doc.blocks.map(ensureBlockShape) : [];
-  project.notes ??= { blocks: [] };
-  project.notes.blocks = Array.isArray(project.notes.blocks) ? project.notes.blocks.map(ensureBlockShape) : [];
+  project.doc = ensureBlockContainerShape(project.doc);
+  project.notes = ensureBlockContainerShape(project.notes);
+  ensureMediaCategoryBucket(project, 'photo');
+  ensureMediaCategoryBucket(project, 'video');
+  ensureMediaCategoryBucket(project, 'sound');
   project.milestones = Array.isArray(project.milestones) && project.milestones.length
     ? project.milestones.map(ensureMilestoneShape)
     : [createMilestone('Milestone 1')];
@@ -431,18 +586,240 @@ function ensureProjectShape(project) {
   return project;
 }
 
+function defaultBlockCategory() {
+  return { id: 'blockcat_default', title: 'Main', createdAt: now(), updatedAt: now() };
+}
+
+function ensureBlockCategoryShape(category, fallback = 'Main') {
+  category.id = String(category.id ?? 'blockcat_' + uid());
+  category.title ??= fallback;
+  category.createdAt ??= now();
+  category.updatedAt ??= now();
+  return category;
+}
+
+function blockMatchesCategory(block, categoryId) {
+  return sameId(ensureBlockShape(block).categoryId, categoryId);
+}
+
+function visibleBlocksForCategory(blocks, categoryId) {
+  return categoryId
+    ? blocks.filter(block => blockMatchesCategory(block, categoryId))
+    : blocks.map(ensureBlockShape);
+}
+
+function ensureBlockContainerShape(container) {
+  if (!container || typeof container !== 'object') container = { blocks: [] };
+  if (Array.isArray(container.blocks)) {
+    container.blocks.forEach(ensureBlockShape);
+  } else {
+    container.blocks = [];
+  }
+  container.categories = Array.isArray(container.categories) && container.categories.length
+    ? container.categories.map((category, index) => ensureBlockCategoryShape(category, index ? 'Category' : 'Main'))
+    : [defaultBlockCategory()];
+  container.activeCategoryId = String(container.activeCategoryId ?? container.categories[0]?.id ?? 'blockcat_default');
+  container.blocks.forEach(block => {
+    if (!container.categories.some(category => sameId(category.id, block.categoryId))) block.categoryId = container.categories[0].id;
+  });
+  return container;
+}
+
+function getActiveBlockCategory(container) {
+  ensureBlockContainerShape(container);
+  let category = container.categories.find(item => sameId(item.id, container.activeCategoryId));
+  if (!category) {
+    category = container.categories[0];
+    container.activeCategoryId = category.id;
+  }
+  return category;
+}
+
+function addBlockCategory(container, onDone) {
+  askText('New Category', '', 'Create', title => {
+    const category = ensureBlockCategoryShape({
+      id: 'blockcat_' + uid(),
+      title,
+      createdAt: now(),
+      updatedAt: now(),
+    });
+    ensureBlockContainerShape(container);
+    container.categories.push(category);
+    container.activeCategoryId = category.id;
+    onDone();
+  });
+}
+
+function blockCategoryControlsHTML(container, prefix) {
+  ensureBlockContainerShape(container);
+  const active = getActiveBlockCategory(container);
+  const activeCount = container.blocks.filter(block => blockMatchesCategory(block, active.id)).length;
+  return `
+    <div class="category-controls">
+      <button type="button" class="category-menu-btn" id="${esc(prefix)}-category">
+        <span>${esc(active.title)}</span>
+        <small>${activeCount}</small>
+        <span class="select-caret">v</span>
+      </button>
+      <button class="mini-btn" id="${esc(prefix)}-category-add">+ Category</button>
+      <button class="ghost-btn" id="${esc(prefix)}-sort-importance">Sort importance</button>
+      <button class="ghost-btn" id="${esc(prefix)}-copy-category">Copy category</button>
+      <button class="ghost-btn" id="${esc(prefix)}-copy-all">Copy all</button>
+    </div>`;
+}
+
+function bindBlockCategoryControls(container, prefix, onChange) {
+  ensureBlockContainerShape(container);
+  const btn = $(`${prefix}-category`);
+  if (btn) {
+    btn.onclick = e => {
+      openCategoryMenu(e.currentTarget, container.categories, container.activeCategoryId, category => {
+        container.activeCategoryId = category.id;
+        onChange(true);
+      }, {
+        title: 'Note categories',
+        countFor: category => container.blocks.filter(block => blockMatchesCategory(block, category.id)).length,
+      });
+    };
+  }
+  const add = $(`${prefix}-category-add`);
+  if (add) add.onclick = () => addBlockCategory(container, () => onChange(true));
+  const sort = $(`${prefix}-sort-importance`);
+  if (sort) sort.onclick = () => {
+    sortBlocksByImportance(container, getActiveBlockCategory(container).id);
+    onChange(true);
+  };
+  const copyCategory = $(`${prefix}-copy-category`);
+  if (copyCategory) copyCategory.onclick = () => copyBlockContainerToClipboard(container, getActiveBlockCategory(container).id);
+  const copyAll = $(`${prefix}-copy-all`);
+  if (copyAll) copyAll.onclick = () => copyBlockContainerToClipboard(container);
+}
+
+function mediaCategoryControlsHTML(owner, kind, prefix, scope) {
+  const categories = getMediaCategories(owner, kind);
+  const active = getActiveMediaCategory(owner, kind);
+  const activeCount = mediaCategoryCount(owner.id, scope, kind, active.id);
+  return `
+    <div class="category-controls media-category-controls">
+      <button type="button" class="category-menu-btn" id="${esc(prefix)}-category">
+        <span>${esc(active.title)}</span>
+        <small>${activeCount}</small>
+        <span class="select-caret">v</span>
+      </button>
+      <button class="mini-btn" id="${esc(prefix)}-category-add">+ Category</button>
+    </div>`;
+}
+
+function bindMediaCategoryControls(owner, kind, prefix, scope, onChange) {
+  getMediaCategories(owner, kind);
+  const btn = $(`${prefix}-category`);
+  if (btn) {
+    btn.onclick = e => {
+      openCategoryMenu(e.currentTarget, getMediaCategories(owner, kind), getActiveMediaCategory(owner, kind).id, category => {
+        setActiveMediaCategory(owner, kind, category.id);
+        onChange(true);
+      }, {
+        title: `${mediaCategoryLabel(kind)} categories`,
+        countFor: category => mediaCategoryCount(owner.id, scope, kind, category.id),
+      });
+    };
+  }
+  const add = $(`${prefix}-category-add`);
+  if (add) add.onclick = () => createMediaCategoryFlow(owner, kind, () => onChange(true));
+}
+
+function createMediaCategoryFlow(owner, kind, onDone) {
+  askText(`New ${mediaCategoryLabel(kind)} Category`, '', 'Create', title => {
+    const category = ensureImageCategoryShape({
+      id: 'imgcat_' + uid(),
+      title,
+      createdAt: now(),
+      updatedAt: now(),
+    });
+    getMediaCategories(owner, kind).push(category);
+    setActiveMediaCategory(owner, kind, category.id);
+    onDone();
+  });
+}
+
+function moveBlockBefore(blocks, draggedId, beforeId, categoryId) {
+  if (!categoryId) return moveItemBefore(blocks, draggedId, beforeId);
+  const visible = visibleBlocksForCategory(blocks, categoryId);
+  if (!moveItemBefore(visible, draggedId, beforeId)) return false;
+  let index = 0;
+  blocks.splice(0, blocks.length, ...blocks.map(block => blockMatchesCategory(block, categoryId) ? visible[index++] : block));
+  return true;
+}
+
+function moveBlockByOffset(blocks, blockId, offset, categoryId) {
+  const visible = visibleBlocksForCategory(blocks, categoryId);
+  const from = visible.findIndex(block => sameId(block.id, blockId));
+  const to = from + offset;
+  if (from < 0 || to < 0 || to >= visible.length) return false;
+  const beforeId = offset < 0 ? visible[to].id : visible[to + 1]?.id || null;
+  return categoryId
+    ? moveBlockBefore(blocks, blockId, beforeId, categoryId)
+    : moveItemBefore(blocks, blockId, beforeId);
+}
+
+function sortBlocksByImportance(container, categoryId) {
+  ensureBlockContainerShape(container);
+  const visible = visibleBlocksForCategory(container.blocks, categoryId);
+  sortByImportance(visible);
+  let index = 0;
+  container.blocks.splice(0, container.blocks.length, ...container.blocks.map(block => blockMatchesCategory(block, categoryId) ? visible[index++] : block));
+}
+
+function sortMediaByImportance(items) {
+  sortByImportance(items);
+  items.forEach((item, index) => {
+    item.order = index;
+    item.updatedAt = now();
+  });
+}
+
+function reorderMediaBefore(ownerId, scope, kind, categoryId, draggedId, beforeId) {
+  const ordered = S.media
+    .map(ensureMediaShape)
+    .filter(media => (
+      media.gameId === ownerId &&
+      media.scope === scope &&
+      media.kind === kind &&
+      media.categoryId === categoryId
+    ))
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+  if (!moveItemBefore(ordered, draggedId, beforeId)) return false;
+  ordered.forEach((media, index) => {
+    media.order = index;
+    media.updatedAt = now();
+  });
+  return true;
+}
+
+function persistBlockHeight(el, block, callbacks) {
+  const save = () => {
+    const next = Math.round(el.getBoundingClientRect().height);
+    if (!next || Math.abs(next - Number(block.height || 0)) < 2) return;
+    block.height = Math.max(120, Math.min(900, next));
+    block.updatedAt = now();
+    callbacks.onChange();
+  };
+  el.addEventListener('mouseup', save);
+  el.addEventListener('blur', save);
+}
+
 function getProjectMedia(projectId, kind) {
   return S.media
+    .map(ensureMediaShape)
     .filter(media => media.gameId === projectId && media.scope === 'projectMedia' && (!kind || media.kind === kind))
-    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
 }
 
 function getBoardPhotos(board) {
   if (!board) return [];
   return (board.photoIds || [])
     .map(id => getMediaById(id))
-    .filter(Boolean)
-    .sort((a, b) => String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+    .filter(Boolean);
 }
 
 function getMilestoneTasks(milestone) {
@@ -480,6 +857,449 @@ function touchProject(project) {
   if (project) project.updatedAt = now();
 }
 
+function defaultImageCategory() {
+  return { id: 'imgcat_default', title: 'Main', createdAt: now(), updatedAt: now() };
+}
+
+function ensureImageCategoryShape(category, fallback = 'Main') {
+  category.id ??= 'imgcat_' + uid();
+  category.title ??= fallback;
+  category.createdAt ??= now();
+  category.updatedAt ??= now();
+  return category;
+}
+
+const MEDIA_CATEGORY_FIELDS = {
+  photo: ['imageCategories', 'activeImageCategoryId', 'Image'],
+  video: ['videoCategories', 'activeVideoCategoryId', 'Video'],
+  sound: ['soundCategories', 'activeSoundCategoryId', 'Audio'],
+};
+
+function mediaCategoryConfig(kind) {
+  return MEDIA_CATEGORY_FIELDS[kind] || MEDIA_CATEGORY_FIELDS.photo;
+}
+
+function ensureMediaCategoryBucket(owner, kind) {
+  const [listKey, activeKey] = mediaCategoryConfig(kind);
+  owner[listKey] = Array.isArray(owner[listKey]) && owner[listKey].length
+    ? owner[listKey].map((category, index) => ensureImageCategoryShape(category, index ? 'Category' : 'Main'))
+    : [defaultImageCategory()];
+  owner[activeKey] ??= owner[listKey][0]?.id || null;
+  return owner[listKey];
+}
+
+function getMediaCategories(owner, kind) {
+  return ensureMediaCategoryBucket(owner, kind);
+}
+
+function getActiveMediaCategory(owner, kind) {
+  const [listKey, activeKey] = mediaCategoryConfig(kind);
+  const categories = getMediaCategories(owner, kind);
+  let category = categories.find(item => item.id === owner[activeKey]);
+  if (!category) {
+    category = categories[0];
+    owner[activeKey] = category.id;
+  }
+  return category;
+}
+
+function setActiveMediaCategory(owner, kind, categoryId) {
+  const [, activeKey] = mediaCategoryConfig(kind);
+  const categories = getMediaCategories(owner, kind);
+  const category = categories.find(item => item.id === categoryId) || categories[0];
+  owner[activeKey] = category.id;
+  return category;
+}
+
+function mediaCategoryCount(ownerId, scope, kind, categoryId) {
+  return S.media
+    .map(ensureMediaShape)
+    .filter(media => media.gameId === ownerId && media.scope === scope && media.kind === kind && media.categoryId === categoryId)
+    .length;
+}
+
+function mediaCategoryLabel(kind) {
+  return mediaCategoryConfig(kind)[2];
+}
+
+function ensureMediaShape(media) {
+  media.id ??= 'm_' + uid();
+  media.scope ??= 'game';
+  media.kind ??= media.type === 'audio' ? 'sound' : media.type === 'video' || media.type === 'gif' ? 'video' : 'photo';
+  media.type ??= inferMediaType(media.path || media.originalPath || '');
+  media.name ??= nodePath.basename(media.path || media.originalPath || 'Media', nodePath.extname(media.path || media.originalPath || ''));
+  media.description ??= '';
+  media.tags = Array.isArray(media.tags) ? media.tags : [];
+  media.importance = importanceLevel(media.importance).id;
+  media.order ??= 0;
+  media.categoryId ??= 'imgcat_default';
+  media.createdAt ??= now();
+  media.updatedAt ??= now();
+  return media;
+}
+
+function moveItemBefore(items, draggedId, beforeId) {
+  const from = items.findIndex(item => sameId(item.id, draggedId));
+  if (from < 0) return false;
+  const [item] = items.splice(from, 1);
+  let to = beforeId ? items.findIndex(next => sameId(next.id, beforeId)) : items.length;
+  if (to < 0) to = items.length;
+  items.splice(to, 0, item);
+  return true;
+}
+
+function moveIdBefore(ids, draggedId, beforeId) {
+  const from = ids.findIndex(id => sameId(id, draggedId));
+  if (from < 0) return false;
+  ids.splice(from, 1);
+  let to = beforeId ? ids.findIndex(id => sameId(id, beforeId)) : ids.length;
+  if (to < 0) to = ids.length;
+  ids.splice(to, 0, draggedId);
+  return true;
+}
+
+function bindSortableIdCard(card, id, mime, onMove) {
+  card.draggable = true;
+  card.addEventListener('dragstart', e => {
+    if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.closest('.rarity-badge, .remove-board-photo, .remove-project-media, .remove-game-media')) {
+      e.preventDefault();
+      return;
+    }
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData(mime, id);
+    e.dataTransfer.setData('text/plain', id);
+    card.classList.add('dragging');
+    card.dataset.draggingCard = '1';
+  });
+  card.addEventListener('dragend', () => {
+    card.classList.remove('dragging');
+    card.classList.remove('drop-before');
+    card.dataset.justDraggedCard = '1';
+    delete card.dataset.draggingCard;
+    setTimeout(() => delete card.dataset.justDraggedCard, 180);
+  });
+  card.addEventListener('click', e => {
+    if (!card.dataset.draggingCard && !card.dataset.justDraggedCard) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }, true);
+  card.addEventListener('dragover', e => {
+    e.preventDefault();
+    if (hasMoveDragType(e, mime)) card.classList.add('drop-before');
+  });
+  card.addEventListener('dragleave', () => card.classList.remove('drop-before'));
+  card.addEventListener('drop', e => {
+    e.preventDefault();
+    card.classList.remove('drop-before');
+    const draggedId = getDraggedId(e, mime);
+    if (draggedId && draggedId !== id) onMove(draggedId, id);
+  });
+}
+
+function placeBlockPlaceholder(list, placeholder, draggedId, clientY) {
+  const beforeId = blockInsertBeforeId(list, draggedId, clientY);
+  const beforeCard = beforeId
+    ? Array.from(list.querySelectorAll('.note-card[data-block-id]')).find(item => item.dataset.blockId === beforeId)
+    : null;
+  const spacer = list.querySelector('.notes-spacer');
+  list.insertBefore(placeholder, beforeCard || spacer || null);
+}
+
+function blockInsertBeforeId(list, draggedId, clientY) {
+  const draggedKey = String(draggedId);
+  const cards = Array.from(list.querySelectorAll('.note-card[data-block-id]'))
+    .filter(item => item.dataset.blockId !== draggedKey);
+  for (const target of cards) {
+    const rect = target.getBoundingClientRect();
+    if (clientY < rect.top + rect.height / 2) {
+      return target.dataset.blockId || null;
+    }
+  }
+  return null;
+}
+
+function blockOrderFromPlaceholder(list, placeholder, draggedId) {
+  const draggedKey = String(draggedId);
+  return Array.from(list.children)
+    .map(child => {
+      if (child === placeholder) return draggedKey;
+      if (child.dataset?.blockId === draggedKey) return null;
+      return child.dataset?.blockId || null;
+    })
+    .filter(Boolean);
+}
+
+function reorderBlocksByVisibleOrder(blocks, orderedIds, categoryId) {
+  const visible = visibleBlocksForCategory(blocks, categoryId);
+  const byId = new Map(visible.map(block => [String(block.id), block]));
+  const ordered = orderedIds.map(id => byId.get(String(id))).filter(Boolean);
+  if (ordered.length !== visible.length) return false;
+  if (visible.every((block, index) => sameId(ordered[index]?.id, block.id))) return false;
+  if (categoryId) {
+    let index = 0;
+    blocks.splice(0, blocks.length, ...blocks.map(block => blockMatchesCategory(block, categoryId) ? ordered[index++] : block));
+  } else {
+    blocks.splice(0, blocks.length, ...ordered);
+  }
+  return true;
+}
+
+function bindSortableBlock(card, blocks, block, categoryId, onReorder) {
+  const blockId = String(ensureBlockShape(block).id);
+  card.dataset.blockId = blockId;
+  const handle = card.querySelector('.drag-handle');
+  const head = card.querySelector('.card-head');
+  if (!handle || !head) return;
+  card.draggable = false;
+  handle.draggable = false;
+  handle.tabIndex = 0;
+  handle.setAttribute('role', 'button');
+  handle.setAttribute('aria-label', 'Move block');
+
+  const startMove = e => {
+    if (e.button !== undefined && e.button !== 0) return;
+    if (e.target.closest('input, textarea, button, select, .rarity-badge, .note-media-open')) return;
+    if (!e.target.closest('.drag-handle, .card-head')) return;
+    const list = card.closest('.notes-list');
+    if (!list) return;
+    e.preventDefault();
+    e.stopPropagation();
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    let offsetX = 0;
+    let offsetY = 0;
+    let dragging = false;
+    let placeholder = null;
+    let preview = null;
+    let previousCardStyle = null;
+    const moveEventName = e.type === 'pointerdown' ? 'pointermove' : 'mousemove';
+    const upEventName = e.type === 'pointerdown' ? 'pointerup' : 'mouseup';
+    const cancelEventName = e.type === 'pointerdown' ? 'pointercancel' : 'mouseleave';
+
+    const copyFieldValues = (source, clone) => {
+      const sourceFields = source.querySelectorAll('input, textarea, select');
+      clone.querySelectorAll('input, textarea, select').forEach((field, index) => {
+        const sourceField = sourceFields[index];
+        if (!sourceField) return;
+        field.value = sourceField.value;
+        if ('checked' in field) field.checked = sourceField.checked;
+      });
+    };
+
+    const beginDrag = moveEvent => {
+      const rect = card.getBoundingClientRect();
+      offsetX = startX - rect.left;
+      offsetY = startY - rect.top;
+      previousCardStyle = card.getAttribute('style');
+      placeholder = document.createElement('div');
+      placeholder.className = 'notes-placeholder';
+      placeholder.style.height = `${Math.round(rect.height)}px`;
+      placeholder.style.margin = getComputedStyle(card).margin;
+      list.insertBefore(placeholder, card);
+
+      preview = card.cloneNode(true);
+      copyFieldValues(card, preview);
+      preview.setAttribute('aria-hidden', 'true');
+      preview.classList.add('dragging', 'dragging-fixed');
+      preview.style.width = `${Math.round(rect.width)}px`;
+      preview.style.left = `${Math.round(rect.left)}px`;
+      preview.style.top = `${Math.round(rect.top)}px`;
+      document.body.appendChild(preview);
+
+      card.classList.add('dragging-source');
+      handle.classList.add('dragging');
+      card.style.display = 'none';
+      dragging = true;
+      updateDrag(moveEvent);
+    };
+
+    const autoScroll = clientY => {
+      const scroller = list.closest('.tab-scroll, .day-scroll, .screen-scroll');
+      if (!scroller) return;
+      const rect = scroller.getBoundingClientRect();
+      if (clientY < rect.top + 52) scroller.scrollTop -= 16;
+      if (clientY > rect.bottom - 52) scroller.scrollTop += 16;
+    };
+
+    const updateDrag = moveEvent => {
+      const clientX = moveEvent.clientX;
+      const clientY = moveEvent.clientY;
+      if (preview) {
+        preview.style.left = `${Math.round(clientX - offsetX)}px`;
+        preview.style.top = `${Math.round(clientY - offsetY)}px`;
+      }
+      placeBlockPlaceholder(list, placeholder, blockId, clientY);
+      autoScroll(clientY);
+    };
+
+    const cleanup = () => {
+      document.removeEventListener(moveEventName, onMove, true);
+      document.removeEventListener(upEventName, onUp, true);
+      document.removeEventListener(cancelEventName, onCancel, true);
+    };
+
+    const restoreCard = () => {
+      preview?.remove();
+      preview = null;
+      card.classList.remove('dragging-source');
+      handle.classList.remove('dragging');
+      if (previousCardStyle === null) card.removeAttribute('style');
+      else card.setAttribute('style', previousCardStyle);
+      if (placeholder?.parentNode) placeholder.parentNode.insertBefore(card, placeholder);
+      placeholder?.remove();
+    };
+
+    const onMove = moveEvent => {
+      const distance = Math.abs(moveEvent.clientX - startX) + Math.abs(moveEvent.clientY - startY);
+      if (!dragging && distance < 4) return;
+      if (!dragging) beginDrag(moveEvent);
+      else updateDrag(moveEvent);
+      moveEvent.preventDefault();
+      moveEvent.stopPropagation();
+    };
+
+    const onUp = upEvent => {
+      cleanup();
+      if (!dragging) return;
+      updateDrag(upEvent);
+      const beforeId = blockInsertBeforeId(list, blockId, upEvent.clientY);
+      const orderedIds = blockOrderFromPlaceholder(list, placeholder, blockId);
+      restoreCard();
+      if (moveBlockBefore(blocks, blockId, beforeId, categoryId) || reorderBlocksByVisibleOrder(blocks, orderedIds, categoryId)) {
+        block.updatedAt = now();
+        onReorder();
+      }
+    };
+
+    const onCancel = () => {
+      cleanup();
+      if (dragging) restoreCard();
+    };
+
+    document.addEventListener(moveEventName, onMove, true);
+    document.addEventListener(upEventName, onUp, true);
+    document.addEventListener(cancelEventName, onCancel, true);
+  };
+
+  if (window.PointerEvent) card.addEventListener('pointerdown', startMove);
+  else card.addEventListener('mousedown', startMove);
+}
+
+function blockTextForCopy(block) {
+  ensureBlockShape(block);
+  if (block.type === 'text') return [block.title || 'Text', block.text || ''].filter(Boolean).join('\n');
+  const media = getMediaById(block.mediaId);
+  return [
+    block.title || media?.name || 'Media',
+    block.caption || media?.description || '',
+  ].filter(Boolean).join('\n');
+}
+
+function copyBlocksToClipboard(blocks) {
+  const text = (blocks || []).map(blockTextForCopy).filter(Boolean).join('\n\n');
+  if (!text.trim()) {
+    toast('Nothing to copy');
+    return;
+  }
+  try {
+    clipboard.writeText(text);
+    toast('Copied');
+  } catch (e) {
+    toast('Could not copy');
+  }
+}
+
+function copyBlockContainerToClipboard(container, categoryId = null) {
+  ensureBlockContainerShape(container);
+  const chunks = [];
+  const categories = categoryId
+    ? container.categories.filter(category => sameId(category.id, categoryId))
+    : container.categories;
+  categories.forEach(category => {
+    const text = container.blocks
+      .filter(block => blockMatchesCategory(block, category.id))
+      .map(blockTextForCopy)
+      .filter(Boolean)
+      .join('\n\n');
+    if (text.trim()) chunks.push(`# ${category.title}\n\n${text}`);
+  });
+  const result = chunks.join('\n\n');
+  if (!result.trim()) {
+    toast('Nothing to copy');
+    return;
+  }
+  try {
+    clipboard.writeText(result);
+    toast('Copied');
+  } catch (e) {
+    toast('Could not copy');
+  }
+}
+
+function routeSnapshot() {
+  return {
+    view: S.view,
+    activeGameId: S.activeGameId,
+    activeTab: S.activeTab,
+    activeMediaId: S.activeMediaId,
+    activeDailyNoteId: S.activeDailyNoteId,
+    activePhotoBoardId: S.activePhotoBoardId,
+    activeProjectId: S.activeProjectId,
+    activeProjectTab: S.activeProjectTab,
+    activeMilestoneId: S.activeMilestoneId,
+    activeKanbanBoardId: S.activeKanbanBoardId,
+  };
+}
+
+function sameRoute(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function pushRoute() {
+  if (restoringRoute) return;
+  const route = routeSnapshot();
+  if (!navStack.length || !sameRoute(navStack[navStack.length - 1], route)) {
+    navStack.push(route);
+    if (navStack.length > 80) navStack.shift();
+  }
+}
+
+function restoreRoute(route) {
+  restoringRoute = true;
+  Object.assign(S, route);
+  renderApp();
+  restoringRoute = false;
+}
+
+function goBack() {
+  const route = navStack.pop();
+  if (route) {
+    restoreRoute(route);
+    return true;
+  }
+  if (S.activeDailyNoteId) {
+    S.activeDailyNoteId = null;
+    renderDailyNotes();
+    return true;
+  }
+  if (S.activePhotoBoardId) {
+    S.activePhotoBoardId = null;
+    renderPhotoBoards();
+    return true;
+  }
+  if (S.activeProjectId) {
+    S.activeProjectId = null;
+    renderProjects();
+    return true;
+  }
+  if (S.view === 'game' || S.view === 'templates') {
+    setView('library', { skipHistory: true });
+    return true;
+  }
+  return false;
+}
+
 function orderedTemplates() {
   return [...S.questionTemplates].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 }
@@ -494,9 +1314,11 @@ function ensureGameShape(game) {
   game.link ??= '';
   game.iconMediaId ??= null;
   game.coverMediaId ??= null;
+  ensureMediaCategoryBucket(game, 'photo');
+  ensureMediaCategoryBucket(game, 'video');
+  ensureMediaCategoryBucket(game, 'sound');
   game.answers ??= {};
-  game.notes ??= { blocks: [] };
-  game.notes.blocks = Array.isArray(game.notes.blocks) ? game.notes.blocks.map(ensureBlockShape) : [];
+  game.notes = ensureBlockContainerShape(game.notes);
   game.collapsedQuestions ??= [];
   game.createdAt ??= now();
   game.updatedAt ??= now();
@@ -535,6 +1357,7 @@ function touchGame(gameId) {
 function markDirty() {
   S.modified = true;
   updateChrome();
+  scheduleScrollRestore();
 }
 
 function updateChrome() {
@@ -578,12 +1401,14 @@ function closeModal() {
   modalCb = null;
 }
 
-function setView(view) {
+function setView(view, options = {}) {
   if (S.view !== 'game' || view !== 'game') stopViewer();
   closeAlbumLightbox();
   closeTaskNotebook();
   closeImportanceMenu();
   closeMilestoneMenu();
+  closeCategoryMenu();
+  if (!options.skipHistory && S.view !== view) pushRoute();
   if (view === 'daily-notes') S.activeDailyNoteId = null;
   if (view === 'photo-boards') S.activePhotoBoardId = null;
   if (view === 'projects') S.activeProjectId = null;
@@ -591,8 +1416,9 @@ function setView(view) {
   renderApp();
 }
 
-function openGame(gameId, tab = 'questions') {
+function openGame(gameId, tab = 'questions', options = {}) {
   stopViewer();
+  if (!options.skipHistory && (S.view !== 'game' || S.activeGameId !== gameId || S.activeTab !== tab)) pushRoute();
   S.view = 'game';
   S.activeGameId = gameId;
   S.activeTab = tab;
@@ -654,6 +1480,7 @@ function renderLibrary() {
   $('library-templates').onclick = () => setView('templates');
   $('game-search').oninput = e => {
     S.gameSearch = e.target.value;
+    scheduleScrollRestore();
     renderLibraryCards();
   };
 
@@ -703,7 +1530,7 @@ function renderDailyNotes() {
     <section class="screen">
       <div class="screen-head">
         <div class="title-wrap">
-          <h1 class="screen-title">Daily Notes</h1>
+          <h1 class="screen-title">Notes</h1>
         </div>
         <div class="head-actions">
           <input class="text-input search-input" id="daily-search" value="${esc(S.dailySearch || '')}" placeholder="Search">
@@ -719,6 +1546,7 @@ function renderDailyNotes() {
   $('add-date-note').onclick = () => createDailyNote($('note-date-picker').value || todayISO());
   $('daily-search').oninput = e => {
     S.dailySearch = e.target.value;
+    scheduleScrollRestore();
     renderDailyNoteCards();
   };
   renderDailyNoteCards();
@@ -768,6 +1596,7 @@ function buildDailyNoteCard(note) {
     </div>
     <div class="card-sub">${blockCount} blocks</div>`;
   card.onclick = () => {
+    pushRoute();
     S.activeDailyNoteId = note.id;
     renderDailyNotes();
   };
@@ -783,7 +1612,6 @@ function renderDailyNoteWorkspace(note) {
         </div>
         <div class="head-actions">
           ${importanceBadgeHTML(note.importance)}
-          ${importanceMenuButtonHTML(note.importance)}
           <button class="ghost-btn" id="daily-add-text">+ Text</button>
           <button class="ghost-btn" id="daily-add-photo">+ Photo</button>
           <button class="ghost-btn" id="daily-back">Notes</button>
@@ -791,6 +1619,7 @@ function renderDailyNoteWorkspace(note) {
         </div>
       </div>
       <div class="day-scroll">
+        ${blockCategoryControlsHTML(note, 'daily')}
         <div class="notes-list" id="daily-blocks"></div>
       </div>
     </section>`;
@@ -800,25 +1629,31 @@ function renderDailyNoteWorkspace(note) {
     note.updatedAt = now();
     markDirty();
   };
-  document.querySelector('.screen-head .kebab-btn').onclick = e => {
-    e.stopPropagation();
-    openImportanceMenu(e.currentTarget, note.importance, value => {
-      note.importance = value;
-      note.updatedAt = now();
-      markDirty();
-      renderDailyNoteWorkspace(note);
-    });
-  };
+  bindImportanceTriggers(document.querySelector('.screen-head'), () => note.importance, value => {
+    note.importance = value;
+    note.updatedAt = now();
+    markDirty();
+    renderDailyNoteWorkspace(note);
+  });
+  bindBlockCategoryControls(note, 'daily', shouldRender => {
+    note.updatedAt = now();
+    markDirty();
+    if (shouldRender) renderDailyNoteWorkspace(note);
+  });
   $('daily-add-text').onclick = () => {
-    note.blocks.push(createTextBlock());
+    const block = createTextBlock();
+    block.categoryId = getActiveBlockCategory(note).id;
+    note.blocks.push(block);
     note.updatedAt = now();
     markDirty();
     renderDailyNoteWorkspace(note);
   };
   $('daily-add-photo').onclick = () => addDailyNoteMedia(note);
   $('daily-back').onclick = () => {
-    S.activeDailyNoteId = null;
-    renderDailyNotes();
+    if (!goBack()) {
+      S.activeDailyNoteId = null;
+      renderDailyNotes();
+    }
   };
   $('daily-delete').onclick = () => {
     if (!confirm(`Delete notes for ${formatDateTitle(note.date)}?`)) return;
@@ -840,7 +1675,12 @@ function renderDailyNoteWorkspace(note) {
       markDirty();
       renderDailyNoteWorkspace(note);
     },
-  });
+    onReorder: () => {
+      note.updatedAt = now();
+      markDirty();
+      renderDailyNoteWorkspace(note);
+    },
+  }, { categoryId: getActiveBlockCategory(note).id });
 }
 
 function createDailyNote(date) {
@@ -885,6 +1725,7 @@ function renderDailyNoteList() {
         <span class="date-row-sub">${esc(note.title || '')}</span>
       </span>`;
     row.onclick = () => {
+      pushRoute();
       S.activeDailyNoteId = note.id;
       renderDailyNotes();
     };
@@ -915,7 +1756,6 @@ function renderDailyNoteDetail(note) {
       </div>
       <div class="head-actions">
         ${importanceBadgeHTML(note.importance)}
-        ${importanceMenuButtonHTML(note.importance)}
         <button class="ghost-btn" id="daily-add-text">+ Text</button>
         <button class="ghost-btn" id="daily-add-photo">+ Photo</button>
         <button class="danger-btn" id="daily-delete">Delete</button>
@@ -931,17 +1771,16 @@ function renderDailyNoteDetail(note) {
     markDirty();
     renderDailyNoteList();
   };
-  document.querySelector('.day-head .kebab-btn').onclick = e => {
-    e.stopPropagation();
-    openImportanceMenu(e.currentTarget, note.importance, value => {
-      note.importance = value;
-      note.updatedAt = now();
-      markDirty();
-      renderDailyNoteDetail(note);
-    });
-  };
+  bindImportanceTriggers(document.querySelector('.day-head'), () => note.importance, value => {
+    note.importance = value;
+    note.updatedAt = now();
+    markDirty();
+    renderDailyNoteDetail(note);
+  });
   $('daily-add-text').onclick = () => {
-    note.blocks.push(createTextBlock());
+    const block = createTextBlock();
+    block.categoryId = getActiveBlockCategory(note).id;
+    note.blocks.push(block);
     note.updatedAt = now();
     markDirty();
     renderDailyNoteDetail(note);
@@ -968,99 +1807,142 @@ function renderDailyNoteDetail(note) {
       markDirty();
       renderDailyNoteDetail(note);
     },
+    onReorder: () => {
+      note.updatedAt = now();
+      markDirty();
+      renderDailyNoteDetail(note);
+    },
   });
 }
 
-function renderEditableBlocks(list, blocks, callbacks) {
+function renderEditableBlocks(list, blocks, callbacks, options = {}) {
   if (!list) return;
+  const categoryId = options.categoryId || null;
+  const visibleBlocks = visibleBlocksForCategory(blocks, categoryId);
+  const handleReorder = () => {
+    callbacks.onChange();
+    if (callbacks.onReorder) callbacks.onReorder();
+    else renderEditableBlocks(list, blocks, callbacks, options);
+  };
+  list.classList.add('has-spacer');
   list.innerHTML = '';
-  if (!blocks.length) {
+  const appendSpacer = () => {
+    const spacer = document.createElement('div');
+    spacer.className = 'notes-spacer';
+    list.appendChild(spacer);
+  };
+  if (!visibleBlocks.length) {
     list.innerHTML = '<div class="block-card"><div class="empty-title">Empty</div></div>';
+    appendSpacer();
     return;
   }
 
-  blocks.forEach(block => {
+  visibleBlocks.forEach((block, visibleIndex) => {
     ensureBlockShape(block);
     const card = document.createElement('div');
     card.className = `note-card block-note importance-surface-${esc(importanceLevel(block.importance).id)}`;
+    const moveButtons = `
+      <button class="mini-btn block-move-btn" data-block-move="up" ${visibleIndex === 0 ? 'disabled' : ''}>Up</button>
+      <button class="mini-btn block-move-btn" data-block-move="down" ${visibleIndex === visibleBlocks.length - 1 ? 'disabled' : ''}>Down</button>`;
     if (block.type === 'text') {
       card.innerHTML = `
         <div class="card-head">
           <div class="block-head-title">
+            <span class="drag-handle" title="Move">::</span>
             ${importanceBadgeHTML(block.importance)}
             <input class="block-title-input" value="${esc(block.title || 'Text')}">
           </div>
           <div class="card-actions">
-            ${importanceMenuButtonHTML(block.importance)}
+            ${moveButtons}
             <button class="danger-btn delete-block">Delete</button>
           </div>
         </div>
         <div class="card-body">
-          <textarea class="text-area block-text" placeholder="Note...">${esc(block.text || '')}</textarea>
+          <textarea class="text-area block-text" style="height:${esc(block.height)}px" placeholder="Note...">${esc(block.text || '')}</textarea>
         </div>`;
       card.querySelector('.block-title-input').oninput = e => {
         block.title = e.target.value;
         block.updatedAt = now();
         callbacks.onChange();
       };
-      card.querySelector('.kebab-btn').onclick = e => {
-        e.stopPropagation();
-        openImportanceMenu(e.currentTarget, block.importance, value => {
-          block.importance = value;
-          block.updatedAt = now();
-          callbacks.onChange();
-          renderEditableBlocks(list, blocks, callbacks);
-        });
-      };
+      bindImportanceTriggers(card, () => block.importance, value => {
+        block.importance = value;
+        block.updatedAt = now();
+        callbacks.onChange();
+        renderEditableBlocks(list, blocks, callbacks, options);
+      });
       card.querySelector('.block-text').oninput = e => {
         block.text = e.target.value;
         block.updatedAt = now();
         callbacks.onChange();
       };
+      persistBlockHeight(card.querySelector('.block-text'), block, callbacks);
     } else {
       const media = getMediaById(block.mediaId);
       card.innerHTML = `
         <div class="card-head">
-          <div>
-            <h3 class="card-title">${esc(block.title || media?.name || 'Media')}</h3>
+          <div class="block-head-title">
+            <span class="drag-handle" title="Move">::</span>
+            ${importanceBadgeHTML(block.importance)}
+            <input class="block-title-input" value="${esc(block.title || media?.name || 'Media')}">
             <div class="card-sub">${esc(mediaKindLabel(media?.kind))}</div>
           </div>
           <div class="card-actions">
-            ${importanceBadgeHTML(block.importance)}
-            ${importanceMenuButtonHTML(block.importance)}
-            ${media ? '<button class="ghost-btn open-block-media">Open</button>' : ''}
+            ${moveButtons}
             <button class="danger-btn delete-block">Delete</button>
           </div>
         </div>
         <div class="card-body">
-          <div class="media-attachments">${mediaChipHTML(block.mediaId, block.id, false)}</div>
+          ${noteMediaPreviewHTML(block)}
           <div class="field" style="margin-top:12px">
             <label class="field-label">Caption</label>
             <input class="text-input block-caption" value="${esc(block.caption || '')}">
           </div>
         </div>`;
-      card.querySelector('.kebab-btn').onclick = e => {
-        e.stopPropagation();
-        openImportanceMenu(e.currentTarget, block.importance, value => {
-          block.importance = value;
-          block.updatedAt = now();
-          callbacks.onChange();
-          renderEditableBlocks(list, blocks, callbacks);
-        });
+      card.querySelector('.block-title-input').oninput = e => {
+        block.title = e.target.value;
+        if (media) {
+          media.name = e.target.value;
+          media.updatedAt = now();
+        }
+        block.updatedAt = now();
+        callbacks.onChange();
       };
+      bindImportanceTriggers(card, () => block.importance, value => {
+        block.importance = value;
+        block.updatedAt = now();
+        callbacks.onChange();
+        renderEditableBlocks(list, blocks, callbacks, options);
+      });
       const caption = card.querySelector('.block-caption');
       if (caption) caption.oninput = e => {
         block.caption = e.target.value;
         block.updatedAt = now();
         callbacks.onChange();
       };
-      const open = card.querySelector('.open-block-media');
-      if (open && media) open.onclick = () => openAlbumPhoto(media.id);
+      const open = card.querySelector('.note-media-open');
+      if (open && media) {
+        open.onclick = () => openAlbumPhoto(media.id);
+        persistBlockHeight(open, block, callbacks);
+      }
     }
 
+    card.querySelectorAll('[data-block-move]').forEach(btn => {
+      btn.onclick = () => {
+        if (btn.disabled) return;
+        const offset = btn.dataset.blockMove === 'up' ? -1 : 1;
+        if (!moveBlockByOffset(blocks, block.id, offset, categoryId)) return;
+        block.updatedAt = now();
+        callbacks.onChange();
+        if (callbacks.onReorder) callbacks.onReorder();
+        else renderEditableBlocks(list, blocks, callbacks, options);
+      };
+    });
     card.querySelector('.delete-block').onclick = () => callbacks.onDelete(block);
+    bindSortableBlock(card, blocks, block, categoryId, handleReorder);
     list.appendChild(card);
   });
+  appendSpacer();
 }
 
 async function addDailyNoteMedia(note) {
@@ -1075,6 +1957,8 @@ async function addDailyNoteMedia(note) {
       title: media.name,
       caption: '',
       importance: note.importance || 'common',
+      categoryId: getActiveBlockCategory(note).id,
+      height: 270,
       createdAt: now(),
       updatedAt: now(),
     });
@@ -1125,6 +2009,7 @@ function renderPhotoBoards() {
   $('new-photo-board').onclick = createPhotoBoardFlow;
   $('photo-search').oninput = e => {
     S.photoSearch = e.target.value;
+    scheduleScrollRestore();
     renderPhotoBoardCards();
   };
   renderPhotoBoardCards();
@@ -1173,6 +2058,7 @@ function buildPhotoBoardCard(board) {
     </div>
     <div class="card-sub">${getBoardPhotos(board).length} photos</div>`;
   card.onclick = () => {
+    pushRoute();
     S.activePhotoBoardId = board.id;
     renderPhotoBoards();
   };
@@ -1196,8 +2082,10 @@ function renderPhotoBoardWorkspace(board) {
     </section>`;
 
   $('photo-board-back').onclick = () => {
-    S.activePhotoBoardId = null;
-    renderPhotoBoards();
+    if (!goBack()) {
+      S.activePhotoBoardId = null;
+      renderPhotoBoards();
+    }
   };
   renderPhotoBoardDetail(board);
 }
@@ -1236,6 +2124,7 @@ function renderPhotoBoardList() {
       <span class="album-board-count">${getBoardPhotos(board).length}</span>`;
     row.onclick = () => {
       S.activePhotoBoardId = board.id;
+      pushRoute();
       renderPhotoBoards();
     };
     list.appendChild(row);
@@ -1263,6 +2152,9 @@ function renderPhotoBoardDetail(board) {
       <div>
         <input id="board-title" class="section-title-input" value="${esc(board.title)}">
       </div>
+      <div class="head-actions">
+        <button class="ghost-btn" id="sort-board-importance">Sort importance</button>
+      </div>
     </div>
     <div class="album-scroll">
       <div class="masonry-grid" id="album-grid"></div>
@@ -1272,6 +2164,14 @@ function renderPhotoBoardDetail(board) {
     board.title = e.target.value;
     board.updatedAt = now();
     markDirty();
+  };
+  $('sort-board-importance').onclick = () => {
+    const sorted = getBoardPhotos(board);
+    sortByImportance(sorted);
+    board.photoIds = sorted.map(media => media.id);
+    board.updatedAt = now();
+    markDirty();
+    renderPhotoBoardDetail(board);
   };
   $('add-board-photos').onclick = () => addPhotosToBoard(board);
   $('delete-board').onclick = () => {
@@ -1299,10 +2199,18 @@ function renderPhotoBoardDetail(board) {
     card.innerHTML = `
       <button class="album-photo-open">${mediaPreviewHTML(media, true)}</button>
       <div class="album-photo-foot">
+        ${importanceBadgeHTML(media.importance)}
         <input class="album-photo-title" value="${esc(media.name)}">
         <button class="mini-btn remove-board-photo">x</button>
       </div>`;
     card.querySelector('.album-photo-open').onclick = () => openAlbumPhoto(media.id);
+    bindImportanceTriggers(card, () => media.importance, value => {
+      media.importance = value;
+      media.updatedAt = now();
+      board.updatedAt = now();
+      markDirty();
+      renderPhotoBoardDetail(board);
+    });
     card.querySelector('.album-photo-title').oninput = e => {
       media.name = e.target.value;
       media.updatedAt = now();
@@ -1317,6 +2225,13 @@ function renderPhotoBoardDetail(board) {
       markDirty();
       renderPhotoBoardDetail(board);
     };
+    bindSortableIdCard(card, media.id, 'application/x-refboard-photo', (draggedId, beforeId) => {
+      if (moveIdBefore(board.photoIds, draggedId, beforeId)) {
+        board.updatedAt = now();
+        markDirty();
+        renderPhotoBoardDetail(board);
+      }
+    });
     grid.appendChild(card);
   });
 
@@ -1325,6 +2240,19 @@ function renderPhotoBoardDetail(board) {
   addCard.innerHTML = '<span>+ Photos</span>';
   addCard.onclick = () => addPhotosToBoard(board);
   grid.appendChild(addCard);
+  const spacer = document.createElement('div');
+  spacer.className = 'media-grid-spacer';
+  spacer.addEventListener('dragover', e => e.preventDefault());
+  spacer.addEventListener('drop', e => {
+    e.preventDefault();
+    const draggedId = e.dataTransfer.getData('application/x-refboard-photo');
+    if (draggedId && moveIdBefore(board.photoIds, draggedId, null)) {
+      board.updatedAt = now();
+      markDirty();
+      renderPhotoBoardDetail(board);
+    }
+  });
+  grid.appendChild(spacer);
 }
 
 async function addPhotosToBoard(board) {
@@ -1357,24 +2285,45 @@ function openAlbumPhoto(mediaId) {
       <button class="ghost-btn" id="album-lightbox-close">Close</button>
     </div>
     <div class="album-lightbox-body">
-      <div class="album-lightbox-stage">
-        ${media.type === 'video'
-          ? `<video id="lightbox-video" src="${esc(url)}" autoplay></video>`
-          : media.type === 'audio'
-            ? `<audio src="${esc(url)}" controls autoplay></audio>`
-          : `<img src="${esc(url)}" draggable="false">`}
+      <div class="album-lightbox-main">
+        <div class="album-lightbox-stage" id="album-lightbox-stage">
+          ${media.type === 'video'
+            ? `<video id="lightbox-video" src="${esc(url)}" autoplay></video>`
+            : media.type === 'audio'
+              ? `<audio src="${esc(url)}" controls autoplay></audio>`
+            : `<img id="lightbox-image" src="${esc(url)}" draggable="false">`}
+        </div>
+        ${media.type === 'video' ? `
+          <div class="lightbox-player bottom-player game-video-player">
+            <div class="lightbox-timeline-row">
+              <span id="lb-current-time" class="t-time">0:00</span>
+              <input id="lb-video-range" class="lightbox-video-range" type="range" min="0" max="1000" value="0">
+              <span id="lb-total-time" class="t-time">0:00</span>
+            </div>
+            <div class="lightbox-controls-row">
+              <div class="lightbox-frame-tools">
+                <button class="mini-btn" id="lb-prev-frame">-1F</button>
+                <button class="mini-btn play-btn" id="lb-play-toggle">Play</button>
+                <button class="mini-btn" id="lb-next-frame">+1F</button>
+                <span id="lb-frame-display">Frame 0</span>
+              </div>
+              <div class="lightbox-speed-tools">
+                <span class="pb-label">Speed</span>
+                <button class="spd lb-spd" data-speed="0.25">0.25x</button>
+                <button class="spd lb-spd" data-speed="0.5">0.5x</button>
+                <button class="spd lb-spd active" data-speed="1">1x</button>
+                <button class="spd lb-spd" data-speed="2">2x</button>
+              </div>
+            </div>
+          </div>` : media.type !== 'audio' ? `
+          <div class="lightbox-zoom-tools">
+            <button class="mini-btn" id="lb-zoom-out">-</button>
+            <span id="lb-zoom-pct">100%</span>
+            <button class="mini-btn" id="lb-zoom-in">+</button>
+            <button class="mini-btn" id="lb-zoom-fit">Fit</button>
+          </div>` : ''}
       </div>
       <aside class="lightbox-notes">
-        ${media.type === 'video' ? `
-          <div class="lightbox-player">
-            <div class="lightbox-frame-tools">
-              <button class="mini-btn" id="lb-prev-frame">-1F</button>
-              <button class="mini-btn" id="lb-play-toggle">Play</button>
-              <button class="mini-btn" id="lb-next-frame">+1F</button>
-            </div>
-            <input id="lb-video-range" class="lightbox-video-range" type="range" min="0" max="1000" value="0">
-            <div class="lightbox-time" id="lb-video-time">0:00 / 0:00</div>
-          </div>` : ''}
         <div class="field">
           <label class="field-label">Note</label>
           <textarea id="lightbox-note" class="text-area lightbox-note-area" placeholder="Notes...">${esc(media.description || '')}</textarea>
@@ -1394,7 +2343,9 @@ function openAlbumPhoto(mediaId) {
   const video = $('lightbox-video');
   if (video) {
     const range = $('lb-video-range');
-    const time = $('lb-video-time');
+    const currentTime = $('lb-current-time');
+    const totalTime = $('lb-total-time');
+    const frameDisplay = $('lb-frame-display');
     const formatVideoTime = seconds => {
       if (!Number.isFinite(seconds)) return '0:00';
       const mins = Math.floor(seconds / 60);
@@ -1404,7 +2355,9 @@ function openAlbumPhoto(mediaId) {
     const syncVideoUI = () => {
       const duration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0;
       if (range && duration) range.value = Math.round((video.currentTime / duration) * 1000);
-      if (time) time.textContent = `${formatVideoTime(video.currentTime)} / ${formatVideoTime(duration)}`;
+      if (currentTime) currentTime.textContent = formatVideoTime(video.currentTime);
+      if (totalTime) totalTime.textContent = formatVideoTime(duration);
+      if (frameDisplay) frameDisplay.textContent = `Frame ~${Math.floor(video.currentTime * 30)}`;
     };
     const step = dir => {
       video.pause();
@@ -1428,9 +2381,70 @@ function openAlbumPhoto(mediaId) {
     }
     video.addEventListener('play', () => { $('lb-play-toggle').textContent = 'Pause'; });
     video.addEventListener('pause', () => { $('lb-play-toggle').textContent = 'Play'; });
+    document.querySelectorAll('.lb-spd').forEach(btn => {
+      btn.onclick = () => {
+        document.querySelectorAll('.lb-spd').forEach(item => item.classList.remove('active'));
+        btn.classList.add('active');
+        video.playbackRate = Number(btn.dataset.speed || 1);
+      };
+    });
     video.addEventListener('loadedmetadata', syncVideoUI);
     video.addEventListener('timeupdate', syncVideoUI);
     syncVideoUI();
+  }
+  const image = $('lightbox-image');
+  const stage = $('album-lightbox-stage');
+  if (image && stage) {
+    let zoom = 1;
+    let panX = 0;
+    let panY = 0;
+    let panning = false;
+    let px = 0;
+    let py = 0;
+    const apply = () => {
+      image.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
+      const pct = $('lb-zoom-pct');
+      if (pct) pct.textContent = Math.round(zoom * 100) + '%';
+    };
+    const fit = () => {
+      const w = image.naturalWidth || image.width;
+      const h = image.naturalHeight || image.height;
+      if (!w || !h) return;
+      zoom = Math.min((stage.clientWidth * .92) / w, (stage.clientHeight * .92) / h, 1);
+      panX = 0;
+      panY = 0;
+      apply();
+    };
+    const change = delta => {
+      zoom = Math.max(.1, Math.min(10, zoom + delta));
+      apply();
+    };
+    $('lb-zoom-in').onclick = () => change(.25);
+    $('lb-zoom-out').onclick = () => change(-.25);
+    $('lb-zoom-fit').onclick = fit;
+    stage.addEventListener('wheel', e => {
+      e.preventDefault();
+      change(e.deltaY < 0 ? .12 : -.12);
+    }, { passive: false });
+    stage.addEventListener('mousedown', e => {
+      if (e.button !== 0) return;
+      panning = true;
+      px = e.clientX;
+      py = e.clientY;
+    });
+    const onMove = e => {
+      if (!panning) return;
+      panX += e.clientX - px;
+      panY += e.clientY - py;
+      px = e.clientX;
+      py = e.clientY;
+      apply();
+    };
+    const onUp = () => { panning = false; };
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    image.onload = fit;
+    fit();
   }
 }
 
@@ -1564,6 +2578,7 @@ function renderProjectLibrary() {
   $('new-project').onclick = createProjectFlow;
   $('project-search').oninput = e => {
     S.projectSearch = e.target.value;
+    scheduleScrollRestore();
     renderProjectCards();
   };
   renderProjectCards();
@@ -1649,10 +2664,11 @@ function createProjectFlow() {
   });
 }
 
-function openProjectWorkspace(projectId, tab = S.activeProjectTab || 'doc') {
+function openProjectWorkspace(projectId, tab = S.activeProjectTab || 'doc', options = {}) {
   const project = S.projects.find(item => item.id === projectId);
   if (!project) return;
   ensureProjectShape(project);
+  if (!options.skipHistory && (S.view !== 'projects' || S.activeProjectId !== projectId || S.activeProjectTab !== tab)) pushRoute();
   S.view = 'projects';
   S.activeProjectId = project.id;
   S.activeProjectTab = tab;
@@ -1693,8 +2709,10 @@ function renderProjectWorkspace(project) {
     </section>`;
 
   $('project-back').onclick = () => {
-    S.activeProjectId = null;
-    renderProjects();
+    if (!goBack()) {
+      S.activeProjectId = null;
+      renderProjects();
+    }
   };
   $('delete-project').onclick = () => {
     if (!confirm(`Delete project "${project.title}"?`)) return;
@@ -1711,6 +2729,7 @@ function renderProjectWorkspace(project) {
   };
   document.querySelectorAll('[data-project-tab]').forEach(btn => {
     btn.onclick = () => {
+      if (S.activeProjectTab !== btn.dataset.projectTab) pushRoute();
       S.activeProjectTab = btn.dataset.projectTab;
       renderProjectWorkspace(project);
     };
@@ -1737,11 +2756,19 @@ function renderProjectDoc(project) {
           <button class="ghost-btn" id="project-doc-photo">+ Photo</button>
         </div>
       </div>
+      ${blockCategoryControlsHTML(project.doc, 'project-doc')}
       <div class="notes-list" id="project-doc-blocks"></div>
     </div>`;
 
+  bindBlockCategoryControls(project.doc, 'project-doc', shouldRender => {
+    touchProject(project);
+    markDirty();
+    if (shouldRender) renderProjectDoc(project);
+  });
   $('project-doc-text').onclick = () => {
-    project.doc.blocks.push(createTextBlock());
+    const block = createTextBlock();
+    block.categoryId = getActiveBlockCategory(project.doc).id;
+    project.doc.blocks.push(block);
     touchProject(project);
     markDirty();
     renderProjectDoc(project);
@@ -1759,7 +2786,12 @@ function renderProjectDoc(project) {
       markDirty();
       renderProjectDoc(project);
     },
-  });
+    onReorder: () => {
+      touchProject(project);
+      markDirty();
+      renderProjectDoc(project);
+    },
+  }, { categoryId: getActiveBlockCategory(project.doc).id });
 }
 
 async function addProjectDocMedia(project) {
@@ -1774,6 +2806,8 @@ async function addProjectDocMedia(project) {
       title: media.name,
       caption: '',
       importance: 'common',
+      categoryId: getActiveBlockCategory(project.doc).id,
+      height: 270,
       createdAt: now(),
       updatedAt: now(),
     });
@@ -1796,11 +2830,19 @@ function renderProjectNotes(project) {
           <button class="ghost-btn" id="project-note-photo">+ Photo</button>
         </div>
       </div>
+      ${blockCategoryControlsHTML(project.notes, 'project-note')}
       <div class="notes-list" id="project-note-blocks"></div>
     </div>`;
 
+  bindBlockCategoryControls(project.notes, 'project-note', shouldRender => {
+    touchProject(project);
+    markDirty();
+    if (shouldRender) renderProjectNotes(project);
+  });
   $('project-note-text').onclick = () => {
-    project.notes.blocks.push(createTextBlock());
+    const block = createTextBlock();
+    block.categoryId = getActiveBlockCategory(project.notes).id;
+    project.notes.blocks.push(block);
     touchProject(project);
     markDirty();
     renderProjectNotes(project);
@@ -1818,7 +2860,12 @@ function renderProjectNotes(project) {
       markDirty();
       renderProjectNotes(project);
     },
-  });
+    onReorder: () => {
+      touchProject(project);
+      markDirty();
+      renderProjectNotes(project);
+    },
+  }, { categoryId: getActiveBlockCategory(project.notes).id });
 }
 
 async function addProjectNoteMedia(project) {
@@ -1833,6 +2880,8 @@ async function addProjectNoteMedia(project) {
       title: media.name,
       caption: '',
       importance: 'common',
+      categoryId: getActiveBlockCategory(project.notes).id,
+      height: 270,
       createdAt: now(),
       updatedAt: now(),
     });
@@ -1845,7 +2894,9 @@ async function addProjectNoteMedia(project) {
 function renderProjectMediaTab(project, kind) {
   const label = kind === 'video' ? 'Video' : kind === 'sound' ? 'Audio' : 'Images';
   const content = $('project-tab-content');
-  const items = getProjectMedia(project.id, kind);
+  const activeCategory = getActiveMediaCategory(project, kind);
+  const items = getProjectMedia(project.id, kind)
+    .filter(item => item.categoryId === activeCategory.id);
   content.innerHTML = `
     <div class="tab-scroll">
       <div class="toolbar">
@@ -1853,13 +2904,28 @@ function renderProjectMediaTab(project, kind) {
           <div class="eyebrow">${label}</div>
         </div>
         <div class="toolbar-right">
+          <button class="ghost-btn" id="project-sort-media">Sort importance</button>
           <button class="ghost-btn" id="project-add-media">+ ${label}</button>
         </div>
       </div>
+      ${mediaCategoryControlsHTML(project, kind, 'project-media', 'projectMedia')}
       <div class="project-media-grid" id="project-media-grid"></div>
     </div>`;
 
   $('project-add-media').onclick = () => addProjectMedia(project, kind);
+  $('project-sort-media').onclick = () => {
+    const sortable = getProjectMedia(project.id, kind).filter(item => item.categoryId === activeCategory.id);
+    sortMediaByImportance(sortable);
+    touchProject(project);
+    markDirty();
+    renderProjectMediaTab(project, kind);
+  };
+  bindMediaCategoryControls(project, kind, 'project-media', 'projectMedia', () => {
+    S.activeMediaId = null;
+    touchProject(project);
+    markDirty();
+    renderProjectMediaTab(project, kind);
+  });
   const grid = $('project-media-grid');
   if (!items.length) {
     grid.innerHTML = `<button class="album-drop-card fixed-drop" id="project-empty-media">+ ${esc(label)}</button>`;
@@ -1872,10 +2938,18 @@ function renderProjectMediaTab(project, kind) {
     card.innerHTML = `
       <button class="album-photo-open">${mediaPreviewHTML(item, true)}</button>
       <div class="album-photo-foot">
+        ${importanceBadgeHTML(item.importance)}
         <input class="album-photo-title" value="${esc(item.name)}">
         <button class="mini-btn remove-project-media">x</button>
       </div>`;
     card.querySelector('.album-photo-open').onclick = () => openAlbumPhoto(item.id);
+    bindImportanceTriggers(card, () => item.importance, value => {
+      item.importance = value;
+      item.updatedAt = now();
+      touchProject(project);
+      markDirty();
+      renderProjectMediaTab(project, kind);
+    });
     card.querySelector('.album-photo-title').oninput = e => {
       item.name = e.target.value;
       item.updatedAt = now();
@@ -1889,6 +2963,13 @@ function renderProjectMediaTab(project, kind) {
       markDirty();
       renderProjectMediaTab(project, kind);
     };
+    bindSortableIdCard(card, item.id, 'application/x-refboard-project-media', (draggedId, beforeId) => {
+      if (reorderMediaBefore(project.id, 'projectMedia', kind, activeCategory.id, draggedId, beforeId)) {
+        touchProject(project);
+        markDirty();
+        renderProjectMediaTab(project, kind);
+      }
+    });
     grid.appendChild(card);
   });
   const add = document.createElement('button');
@@ -1896,6 +2977,24 @@ function renderProjectMediaTab(project, kind) {
   add.textContent = `+ ${label}`;
   add.onclick = () => addProjectMedia(project, kind);
   grid.appendChild(add);
+  const spacer = document.createElement('div');
+  spacer.className = 'media-grid-spacer';
+  spacer.addEventListener('dragover', e => {
+    e.preventDefault();
+    if (hasMoveDragType(e, 'application/x-refboard-project-media')) spacer.classList.add('drag-over');
+  });
+  spacer.addEventListener('dragleave', () => spacer.classList.remove('drag-over'));
+  spacer.addEventListener('drop', e => {
+    e.preventDefault();
+    spacer.classList.remove('drag-over');
+    const draggedId = getDraggedId(e, 'application/x-refboard-project-media');
+    if (draggedId && reorderMediaBefore(project.id, 'projectMedia', kind, activeCategory.id, draggedId, null)) {
+      touchProject(project);
+      markDirty();
+      renderProjectMediaTab(project, kind);
+    }
+  });
+  grid.appendChild(spacer);
 }
 
 async function addProjectMedia(project, kind) {
@@ -1944,6 +3043,31 @@ function renderProjectKanban(project) {
   $('milestone-select').onclick = e => openMilestoneMenu(e.currentTarget, project);
   $('new-milestone').onclick = () => createMilestoneFlow(project);
   renderMilestoneDetail(project, milestone);
+  maybeCelebrateMilestone(project, milestone, stats);
+}
+
+function maybeCelebrateMilestone(project, milestone, stats = milestoneStats(milestone)) {
+  if (!stats.total || stats.pct < 100 || milestone.celebratedAt) return;
+  milestone.celebratedAt = now();
+  milestone.updatedAt = now();
+  touchProject(project);
+  markDirty();
+  showMilestoneCompleteEffect(milestone);
+}
+
+function showMilestoneCompleteEffect(milestone) {
+  const old = $('milestone-complete-effect');
+  if (old) old.remove();
+  const effect = document.createElement('div');
+  effect.id = 'milestone-complete-effect';
+  effect.innerHTML = `
+    <div class="complete-burst">
+      <div class="complete-title">Milestone Complete</div>
+      <div class="complete-name">${esc(milestone.title)}</div>
+    </div>`;
+  document.body.appendChild(effect);
+  setTimeout(() => effect.classList.add('show'), 20);
+  setTimeout(() => effect.remove(), 1900);
 }
 
 function renderMilestoneList(project) {
@@ -2086,11 +3210,23 @@ function renderKanbanBoard(project, milestone, board) {
     col.innerHTML = `
       <div class="kanban-column-head">
         <span>${esc(label)}</span>
-        <span class="column-count">${tasks.length}</span>
+        <span class="kanban-column-tools">
+          <button class="column-sort-btn" data-sort-column="${esc(key)}">Sort</button>
+          <span class="column-count">${tasks.length}</span>
+        </span>
       </div>
       <button class="mini-add-task" data-add-task="${esc(key)}">+ Task</button>
       <div class="task-list" data-column="${esc(key)}"></div>`;
     col.querySelector('[data-add-task]').onclick = () => addTaskFlow(project, milestone, board, key);
+    col.querySelector('[data-sort-column]').onclick = e => {
+      e.stopPropagation();
+      sortByImportance(board.columns[key]);
+      board.updatedAt = now();
+      milestone.updatedAt = now();
+      touchProject(project);
+      markDirty();
+      renderProjectWorkspace(project);
+    };
     const taskList = col.querySelector('.task-list');
     taskList.addEventListener('dragover', e => {
       e.preventDefault();
@@ -2113,8 +3249,10 @@ function buildTaskCard(project, milestone, board, columnKey, task) {
   ensureTaskShape(task);
   const card = document.createElement('div');
   card.className = `task-card task-importance-${esc(importanceLevel(task.importance).id)}`;
+  let dragging = false;
   card.draggable = true;
   card.addEventListener('dragstart', e => {
+    dragging = true;
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('application/x-refboard-task', JSON.stringify({
       boardId: board.id,
@@ -2123,30 +3261,33 @@ function buildTaskCard(project, milestone, board, columnKey, task) {
     }));
     card.classList.add('dragging');
   });
-  card.addEventListener('dragend', () => card.classList.remove('dragging'));
+  card.addEventListener('dragend', () => {
+    card.classList.remove('dragging');
+    setTimeout(() => { dragging = false; }, 0);
+  });
   const meta = [
     (task.notes || '').trim().slice(0, 96),
     (task.mediaIds || []).length ? `${(task.mediaIds || []).length} media` : '',
   ].filter(Boolean).join(' - ');
   card.innerHTML = `
     <div class="task-card-top">
-      <button class="task-title-btn">${esc(task.title || 'Untitled')}</button>
-      ${importanceMenuButtonHTML(task.importance)}
+      ${importanceBadgeHTML(task.importance)}
+      <span class="task-title-btn">${esc(task.title || 'Untitled')}</span>
     </div>
     ${meta ? `<div class="task-card-meta">${esc(meta)}</div>` : ''}`;
-  card.querySelector('.task-title-btn').onclick = () => openTaskNotebook(project.id, milestone.id, board.id, columnKey, task.id);
-  card.querySelector('.kebab-btn').onclick = e => {
-    e.stopPropagation();
-    openImportanceMenu(e.currentTarget, task.importance, value => {
-      task.importance = value;
-      task.updatedAt = now();
-      board.updatedAt = now();
-      milestone.updatedAt = now();
-      touchProject(project);
-      markDirty();
-      renderProjectWorkspace(project);
-    });
-  };
+  card.addEventListener('click', e => {
+    if (dragging || e.target.closest('.rarity-badge')) return;
+    openTaskNotebook(project.id, milestone.id, board.id, columnKey, task.id);
+  });
+  bindImportanceTriggers(card, () => task.importance, value => {
+    task.importance = value;
+    task.updatedAt = now();
+    board.updatedAt = now();
+    milestone.updatedAt = now();
+    touchProject(project);
+    markDirty();
+    renderProjectWorkspace(project);
+  });
   return card;
 }
 
@@ -2182,6 +3323,7 @@ function moveTask(project, milestone, board, fromColumn, taskId, toColumn) {
   markDirty();
 
   const stats = milestoneStats(milestone);
+  maybeCelebrateMilestone(project, milestone, stats);
   if (stats.closed) {
     const index = project.milestones.findIndex(item => item.id === milestone.id);
     const next = project.milestones.slice(index + 1).find(item => !milestoneStats(item).closed);
@@ -2219,7 +3361,6 @@ function openTaskNotebook(projectId, milestoneId, boardId, columnKey, taskId) {
         <input id="task-modal-title" class="section-title-input" value="${esc(task.title)}">
         <div class="head-actions">
           ${importanceBadgeHTML(task.importance)}
-          ${importanceMenuButtonHTML(task.importance)}
           <button class="ghost-btn" id="task-modal-photo">+ Photo</button>
           <button class="danger-btn" id="task-modal-delete">Delete</button>
           <button class="ghost-btn" id="task-modal-close">Close</button>
@@ -2245,18 +3386,15 @@ function openTaskNotebook(projectId, milestoneId, boardId, columnKey, taskId) {
     markDirty();
     renderProjectWorkspace(project);
   };
-  modal.querySelector('.kebab-btn').onclick = e => {
-    e.stopPropagation();
-    openImportanceMenu(e.currentTarget, task.importance, value => {
-      task.importance = value;
-      task.updatedAt = now();
-      touchProject(project);
-      markDirty();
-      closeTaskNotebook();
-      renderProjectWorkspace(project);
-      openTaskNotebook(project.id, milestone.id, board.id, columnKey, task.id);
-    });
-  };
+  bindImportanceTriggers(modal, () => task.importance, value => {
+    task.importance = value;
+    task.updatedAt = now();
+    touchProject(project);
+    markDirty();
+    closeTaskNotebook();
+    renderProjectWorkspace(project);
+    openTaskNotebook(project.id, milestone.id, board.id, columnKey, task.id);
+  });
   $('task-modal-notes').oninput = e => {
     task.notes = e.target.value;
     task.updatedAt = now();
@@ -2312,8 +3450,8 @@ function renderGameWorkspace() {
     ['questions', 'Questions'],
     ['notes', 'Notes'],
     ['photos', 'Images'],
-    ['sound', 'Sound'],
     ['videos', 'Video'],
+    ['sound', 'Audio'],
   ];
   const icon = getMediaById(game.iconMediaId);
 
@@ -2338,7 +3476,9 @@ function renderGameWorkspace() {
       <div class="tab-content" id="tab-content"></div>
     </section>`;
 
-  $('game-back').onclick = () => setView('library');
+  $('game-back').onclick = () => {
+    if (!goBack()) setView('library', { skipHistory: true });
+  };
   $('game-icon').onclick = () => setGameIcon(game);
   $('set-game-icon').onclick = () => setGameIcon(game);
   $('delete-game').onclick = deleteActiveGame;
@@ -2352,6 +3492,7 @@ function renderGameWorkspace() {
   document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.onclick = () => {
       if (S.activeTab !== btn.dataset.tab) stopViewer();
+      if (S.activeTab !== btn.dataset.tab) pushRoute();
       S.activeTab = btn.dataset.tab;
       S.activeMediaId = null;
       renderGameWorkspace();
@@ -2359,9 +3500,9 @@ function renderGameWorkspace() {
   });
 
   if (S.activeTab === 'notes') renderNotesTab(game);
-  else if (S.activeTab === 'photos') renderMediaTab(game, 'photo');
+  else if (S.activeTab === 'photos') renderGameMediaGridTab(game, 'photo');
+  else if (S.activeTab === 'videos') renderGameMediaGridTab(game, 'video');
   else if (S.activeTab === 'sound') renderMediaTab(game, 'sound');
-  else if (S.activeTab === 'videos') renderMediaTab(game, 'video');
   else renderQuestionsTab(game);
 }
 
@@ -2451,7 +3592,7 @@ function renderQuestionsTab(game) {
 
 function renderNotesTab(game) {
   hidePlayback();
-  const blocks = game.notes.blocks;
+  game.notes = ensureBlockContainerShape(game.notes);
   $('tab-content').innerHTML = `
     <div class="tab-scroll">
       <div class="toolbar">
@@ -2467,11 +3608,20 @@ function renderNotesTab(game) {
           <button class="ghost-btn" id="add-note-video">+ Video</button>
         </div>
       </div>
+      ${blockCategoryControlsHTML(game.notes, 'game-note')}
       <div class="notes-list" id="notes-list"></div>
     </div>`;
 
+  bindBlockCategoryControls(game.notes, 'game-note', shouldRender => {
+    touchGame(game.id);
+    markDirty();
+    if (shouldRender) renderNotesTab(game);
+  });
   $('add-note-text').onclick = () => {
-    blocks.push({ id: uid(), type: 'text', text: '' });
+    game.notes = ensureBlockContainerShape(game.notes);
+    const block = createTextBlock();
+    block.categoryId = getActiveBlockCategory(game.notes).id;
+    game.notes.blocks.push(block);
     touchGame(game.id);
     markDirty();
     renderNotesTab(game);
@@ -2480,102 +3630,29 @@ function renderNotesTab(game) {
   $('add-note-sound').onclick = () => addNoteMedia(game, 'sound');
   $('add-note-video').onclick = () => addNoteMedia(game, 'video');
 
-  const list = $('notes-list');
-  if (!blocks.length) {
-    list.innerHTML = '<div class="block-card"><div class="empty-title">Empty</div></div>';
-    return;
-  }
-
-  blocks.forEach(block => {
-    const card = document.createElement('div');
-    ensureBlockShape(block);
-    card.className = `note-card importance-surface-${esc(importanceLevel(block.importance).id)}`;
-    if (block.type === 'text') {
-      card.innerHTML = `
-        <div class="card-head">
-          <div class="block-head-title">
-            ${importanceBadgeHTML(block.importance)}
-            <h3 class="card-title">Text</h3>
-          </div>
-          <div class="card-actions">
-            ${importanceMenuButtonHTML(block.importance)}
-            <button class="danger-btn delete-note">Delete</button>
-          </div>
-        </div>
-        <div class="card-body">
-          <textarea class="text-area note-text" placeholder="Note...">${esc(block.text)}</textarea>
-        </div>`;
-      card.querySelector('.kebab-btn').onclick = e => {
-        e.stopPropagation();
-        openImportanceMenu(e.currentTarget, block.importance, value => {
-          block.importance = value;
-          touchGame(game.id);
-          markDirty();
-          renderNotesTab(game);
-        });
-      };
-      card.querySelector('.note-text').oninput = e => {
-        block.text = e.target.value;
-        touchGame(game.id);
-        markDirty();
-      };
-    } else {
-      const media = getMediaById(block.mediaId);
-      card.innerHTML = `
-        <div class="card-head">
-          <div>
-            <h3 class="card-title">${esc(media?.name || 'Missing file')}</h3>
-            <div class="card-sub">${esc(mediaKindLabel(media?.kind))}</div>
-          </div>
-          <div class="card-actions">
-            ${importanceBadgeHTML(block.importance)}
-            ${importanceMenuButtonHTML(block.importance)}
-            ${media ? '<button class="ghost-btn open-note-media">Open</button>' : ''}
-            <button class="danger-btn delete-note">Delete</button>
-          </div>
-        </div>
-        <div class="card-body">
-          <div class="media-attachments">${mediaChipHTML(block.mediaId, block.id, false)}</div>
-          <div class="field" style="margin-top:12px">
-            <label class="field-label">Caption</label>
-            <input class="text-input note-caption" value="${esc(block.caption || '')}" placeholder="">
-          </div>
-        </div>`;
-      const cap = card.querySelector('.note-caption');
-      if (cap) cap.oninput = e => {
-        block.caption = e.target.value;
-        touchGame(game.id);
-        markDirty();
-      };
-      card.querySelector('.kebab-btn').onclick = e => {
-        e.stopPropagation();
-        openImportanceMenu(e.currentTarget, block.importance, value => {
-          block.importance = value;
-          touchGame(game.id);
-          markDirty();
-          renderNotesTab(game);
-        });
-      };
-      const open = card.querySelector('.open-note-media');
-      if (open && media) open.onclick = () => {
-        S.activeTab = media.kind === 'video' ? 'videos' : media.kind === 'sound' ? 'sound' : 'photos';
-        S.activeMediaId = media.id;
-        renderGameWorkspace();
-      };
-    }
-
-    card.querySelector('.delete-note').onclick = () => {
-      game.notes.blocks = game.notes.blocks.filter(b => b.id !== block.id);
+  renderEditableBlocks($('notes-list'), game.notes.blocks, {
+    ownerName: 'game-note',
+    onChange: () => {
+      touchGame(game.id);
+      markDirty();
+    },
+    onDelete: block => {
+      game.notes.blocks = game.notes.blocks.filter(item => item.id !== block.id);
       touchGame(game.id);
       markDirty();
       renderNotesTab(game);
-    };
-    list.appendChild(card);
-  });
+    },
+    onReorder: () => {
+      touchGame(game.id);
+      markDirty();
+      renderNotesTab(game);
+    },
+  }, { categoryId: getActiveBlockCategory(game.notes).id });
 }
 
 function renderMediaTab(game, kind) {
-  const label = kind === 'video' ? 'Video' : kind === 'sound' ? 'Sound' : 'Images';
+  const label = kind === 'video' ? 'Video' : kind === 'sound' ? 'Audio' : 'Images';
+  const activeCategory = getActiveMediaCategory(game, kind);
 
   $('tab-content').innerHTML = `
     <div class="media-workspace">
@@ -2584,7 +3661,13 @@ function renderMediaTab(game, kind) {
           <div>
             <div class="pane-label">${label}</div>
           </div>
-          <button class="mini-btn" id="add-media-btn">+</button>
+          <div class="panel-mini-actions">
+            <button class="mini-btn" id="sort-media-btn">Sort</button>
+            <button class="mini-btn" id="add-media-btn">+</button>
+          </div>
+        </div>
+        <div class="media-panel-category">
+          ${mediaCategoryControlsHTML(game, kind, 'media-panel', 'game')}
         </div>
         <div class="media-list" id="media-list"></div>
       </aside>
@@ -2613,7 +3696,20 @@ function renderMediaTab(game, kind) {
       </aside>
     </div>`;
 
+  bindMediaCategoryControls(game, kind, 'media-panel', 'game', () => {
+    S.activeMediaId = null;
+    touchGame(game.id);
+    markDirty();
+    renderMediaTab(game, kind);
+  });
   $('add-media-btn').onclick = () => addMediaToActiveGame(kind);
+  $('sort-media-btn').onclick = () => {
+    const sortable = getGameMedia(game.id, kind).filter(item => item.categoryId === activeCategory.id);
+    sortMediaByImportance(sortable);
+    touchGame(game.id);
+    markDirty();
+    renderMediaList(game, kind);
+  };
   bindViewerEvents(kind);
   renderMediaList(game, kind);
 
@@ -2625,9 +3721,127 @@ function renderMediaTab(game, kind) {
   }
 }
 
+function renderGameMediaGridTab(game, kind) {
+  hidePlayback();
+  const label = kind === 'video' ? 'Video' : 'Images';
+  const activeCategory = getActiveMediaCategory(game, kind);
+  const items = getGameMedia(game.id, kind)
+    .filter(item => item.categoryId === activeCategory.id);
+
+  $('tab-content').innerHTML = `
+    <div class="tab-scroll">
+      <div class="toolbar">
+        <div class="toolbar-left">
+          <div class="eyebrow">${label}</div>
+        </div>
+        <div class="toolbar-right">
+          <button class="ghost-btn" id="game-sort-media">Sort importance</button>
+          <button class="ghost-btn" id="game-add-media">+ ${label}</button>
+        </div>
+      </div>
+      ${mediaCategoryControlsHTML(game, kind, 'game-media', 'game')}
+      <div class="project-media-grid" id="game-media-grid"></div>
+    </div>`;
+
+  bindMediaCategoryControls(game, kind, 'game-media', 'game', () => {
+    S.activeMediaId = null;
+    touchGame(game.id);
+    markDirty();
+    renderGameMediaGridTab(game, kind);
+  });
+  $('game-add-media').onclick = () => addMediaToActiveGame(kind);
+  $('game-sort-media').onclick = () => {
+    const sortable = getGameMedia(game.id, kind).filter(item => item.categoryId === activeCategory.id);
+    sortMediaByImportance(sortable);
+    touchGame(game.id);
+    markDirty();
+    renderGameMediaGridTab(game, kind);
+  };
+
+  const grid = $('game-media-grid');
+  if (!items.length) {
+    grid.innerHTML = `<button class="album-drop-card fixed-drop" id="game-empty-media">+ ${esc(label)}</button>`;
+    $('game-empty-media').onclick = () => addMediaToActiveGame(kind);
+    return;
+  }
+
+  items.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'album-photo-card fixed-media-card';
+    card.innerHTML = `
+      <button class="album-photo-open">${mediaPreviewHTML(item, true)}</button>
+      <div class="album-photo-foot">
+        ${importanceBadgeHTML(item.importance)}
+        <input class="album-photo-title" value="${esc(item.name)}">
+        <button class="mini-btn remove-game-media">x</button>
+      </div>`;
+    card.querySelector('.album-photo-open').onclick = () => openAlbumPhoto(item.id);
+    bindImportanceTriggers(card, () => item.importance, value => {
+      item.importance = value;
+      item.updatedAt = now();
+      touchGame(game.id);
+      markDirty();
+      renderGameMediaGridTab(game, kind);
+    });
+    card.querySelector('.album-photo-title').oninput = e => {
+      item.name = e.target.value;
+      item.updatedAt = now();
+      touchGame(game.id);
+      markDirty();
+    };
+    card.querySelector('.remove-game-media').onclick = () => removeGameMediaFromGrid(game, item.id, kind);
+    bindSortableIdCard(card, item.id, 'application/x-refboard-game-grid-media', (draggedId, beforeId) => {
+      if (reorderMediaBefore(game.id, 'game', kind, activeCategory.id, draggedId, beforeId)) {
+        touchGame(game.id);
+        markDirty();
+        renderGameMediaGridTab(game, kind);
+      }
+    });
+    grid.appendChild(card);
+  });
+
+  const add = document.createElement('button');
+  add.className = 'album-drop-card fixed-drop';
+  add.textContent = `+ ${label}`;
+  add.onclick = () => addMediaToActiveGame(kind);
+  grid.appendChild(add);
+  const spacer = document.createElement('div');
+  spacer.className = 'media-grid-spacer';
+  spacer.addEventListener('dragover', e => {
+    e.preventDefault();
+    if (hasMoveDragType(e, 'application/x-refboard-game-grid-media')) spacer.classList.add('drag-over');
+  });
+  spacer.addEventListener('dragleave', () => spacer.classList.remove('drag-over'));
+  spacer.addEventListener('drop', e => {
+    e.preventDefault();
+    spacer.classList.remove('drag-over');
+    const draggedId = getDraggedId(e, 'application/x-refboard-game-grid-media');
+    if (draggedId && reorderMediaBefore(game.id, 'game', kind, activeCategory.id, draggedId, null)) {
+      touchGame(game.id);
+      markDirty();
+      renderGameMediaGridTab(game, kind);
+    }
+  });
+  grid.appendChild(spacer);
+}
+
+function removeGameMediaFromGrid(game, mediaId, kind) {
+  const media = getMediaById(mediaId);
+  if (!media) return;
+  if (!confirm(`Remove "${media.name}"?`)) return;
+  S.media = S.media.filter(item => item.id !== mediaId);
+  if (game.coverMediaId === mediaId) game.coverMediaId = null;
+  if (game.iconMediaId === mediaId) game.iconMediaId = null;
+  touchGame(game.id);
+  markDirty();
+  renderGameMediaGridTab(game, kind);
+}
+
 function renderMediaList(game, kind) {
   const list = $('media-list');
-  const items = getGameMedia(game.id, kind);
+  const activeCategory = getActiveMediaCategory(game, kind);
+  const items = getGameMedia(game.id, kind)
+    .filter(item => item.categoryId === activeCategory.id);
   list.innerHTML = '';
 
   items.forEach(item => {
@@ -2636,12 +3850,27 @@ function renderMediaList(game, kind) {
     thumb.innerHTML = `
       ${mediaPreviewHTML(item, true)}
       <span class="media-badge">${esc(item.type.toUpperCase())}</span>
+      ${importanceBadgeHTML(item.importance)}
       <div class="media-thumb-title">${esc(item.name)}</div>`;
+    bindImportanceTriggers(thumb, () => item.importance, value => {
+      item.importance = value;
+      item.updatedAt = now();
+      touchGame(game.id);
+      markDirty();
+      renderMediaList(game, kind);
+    });
     thumb.onclick = () => {
       S.activeMediaId = item.id;
       renderMediaList(game, kind);
       loadMedia(item);
     };
+    bindSortableIdCard(thumb, item.id, 'application/x-refboard-game-media', (draggedId, beforeId) => {
+      if (reorderMediaBefore(game.id, 'game', kind, activeCategory.id, draggedId, beforeId)) {
+        touchGame(game.id);
+        markDirty();
+        renderMediaList(game, kind);
+      }
+    });
     list.appendChild(thumb);
   });
 
@@ -2661,6 +3890,24 @@ function renderMediaList(game, kind) {
     addDroppedFiles(e.dataTransfer.files, kind);
   });
   list.appendChild(drop);
+  const spacer = document.createElement('div');
+  spacer.className = 'media-grid-spacer';
+  spacer.addEventListener('dragover', e => {
+    e.preventDefault();
+    if (hasMoveDragType(e, 'application/x-refboard-game-media')) spacer.classList.add('drag-over');
+  });
+  spacer.addEventListener('dragleave', () => spacer.classList.remove('drag-over'));
+  spacer.addEventListener('drop', e => {
+    e.preventDefault();
+    spacer.classList.remove('drag-over');
+    const draggedId = getDraggedId(e, 'application/x-refboard-game-media');
+    if (draggedId && reorderMediaBefore(game.id, 'game', kind, activeCategory.id, draggedId, null)) {
+      touchGame(game.id);
+      markDirty();
+      renderMediaList(game, kind);
+    }
+  });
+  list.appendChild(spacer);
 }
 
 function renderInfo(item) {
@@ -2730,6 +3977,12 @@ function mediaChipHTML(mediaId, blockId, removable = true) {
         ${removable ? `<button class="mini-btn" data-remove-block="${esc(blockId)}">x</button>` : ''}
       </div>
     </div>`;
+}
+
+function noteMediaPreviewHTML(block) {
+  const media = getMediaById(block.mediaId);
+  if (!media) return '<div class="note-media-preview missing">Missing</div>';
+  return `<button class="note-media-open" style="height:${esc(block.height || 270)}px">${mediaPreviewHTML(media, true)}</button>`;
 }
 
 function mediaPreviewHTML(media, compact = false) {
@@ -2815,7 +4068,7 @@ async function addQuestionMedia(game, questionId) {
     const type = inferMediaType(fp);
     const kind = type === 'video' || type === 'gif' ? 'video' : 'photo';
     const media = registerMediaFile(fp, game.id, kind);
-    if (media) answer.blocks.push({ id: uid(), type: 'media', mediaId: media.id, caption: '' });
+    if (media) answer.blocks.push({ id: uid(), type: 'media', mediaId: media.id, title: media.name, caption: '', importance: 'common' });
   });
   answer.updatedAt = now();
   touchGame(game.id);
@@ -2824,11 +4077,21 @@ async function addQuestionMedia(game, questionId) {
 }
 
 async function addNoteMedia(game, kind) {
+  game.notes = ensureBlockContainerShape(game.notes);
   const files = await pickMediaFiles(kind);
   if (!files.length) return;
   files.forEach(fp => {
     const media = registerMediaFile(fp, game.id, kind);
-    if (media) game.notes.blocks.push({ id: uid(), type: 'media', mediaId: media.id, caption: '' });
+    if (media) game.notes.blocks.push({
+      id: uid(),
+      type: 'media',
+      mediaId: media.id,
+      title: media.name,
+      caption: '',
+      importance: 'common',
+      categoryId: getActiveBlockCategory(game.notes).id,
+      height: 270,
+    });
   });
   touchGame(game.id);
   markDirty();
@@ -2843,7 +4106,8 @@ async function addMediaToActiveGame(kind) {
   files.forEach(fp => registerMediaFile(fp, game.id, kind));
   touchGame(game.id);
   markDirty();
-  renderMediaTab(game, kind);
+  if (kind === 'photo' || kind === 'video') renderGameMediaGridTab(game, kind);
+  else renderMediaTab(game, kind);
   toast(`Added: ${files.length}`);
 }
 
@@ -2859,7 +4123,8 @@ function addDroppedFiles(fileList, kind) {
   valid.forEach(fp => registerMediaFile(fp, game.id, kind));
   touchGame(game.id);
   markDirty();
-  renderMediaTab(game, kind);
+  if (kind === 'photo' || kind === 'video') renderGameMediaGridTab(game, kind);
+  else renderMediaTab(game, kind);
   toast(`Added: ${valid.length}`);
 }
 
@@ -2885,6 +4150,9 @@ function registerMediaFile(fp, gameId, kind, scope = 'game') {
   if (!kindAllowsFile(kind, fp)) return null;
   const id = 'm_' + uid();
   const type = inferMediaType(fp);
+  const game = S.games.find(item => item.id === gameId);
+  const project = S.projects.find(item => item.id === gameId);
+  const projectMediaOrder = S.media.filter(item => item.gameId === gameId && item.scope === scope && item.kind === kind).length;
   const item = {
     id,
     gameId,
@@ -2896,6 +4164,13 @@ function registerMediaFile(fp, gameId, kind, scope = 'game') {
     originalPath: fp,
     description: '',
     tags: [],
+    importance: 'common',
+    order: projectMediaOrder,
+    categoryId: scope === 'game' && game
+      ? getActiveMediaCategory(game, kind).id
+      : scope === 'projectMedia' && project
+        ? getActiveMediaCategory(project, kind).id
+        : 'imgcat_default',
     copied: false,
     createdAt: now(),
     updatedAt: now(),
@@ -3023,6 +4298,7 @@ function newProject() {
   stopViewer();
   sessionCacheClear();
   S = freshState();
+  navStack = [];
   renderApp();
   toast('New library');
 }
@@ -3066,12 +4342,12 @@ function loadProjectData(data, fp) {
     next.dailyNotes = Array.isArray(data.dailyNotes) ? data.dailyNotes.map(ensureDailyNoteShape) : [];
     next.photoBoards = Array.isArray(data.photoBoards) ? data.photoBoards.map(ensurePhotoBoardShape) : [];
     next.projects = Array.isArray(data.projects) ? data.projects.map(ensureProjectShape) : [];
-    next.media = Array.isArray(data.media) ? data.media : [];
+    next.media = Array.isArray(data.media) ? data.media.map(ensureMediaShape) : [];
   } else {
     const migrated = migrateV1ToV2(data, next.projectName);
     next.questionTemplates = migrated.questionTemplates;
     next.games = migrated.games.map(ensureGameShape);
-    next.media = migrated.media;
+    next.media = migrated.media.map(ensureMediaShape);
     next.dailyNotes = [];
     next.photoBoards = [];
     next.projects = [];
@@ -3088,6 +4364,7 @@ function loadProjectData(data, fp) {
   next.activeMilestoneId = null;
   next.activeKanbanBoardId = null;
   S = next;
+  navStack = [];
   renderApp();
 }
 
@@ -3596,6 +4873,11 @@ function updateFrameDisplay() {
 }
 
 function initControls() {
+  document.addEventListener('pointerdown', rememberScrollState, true);
+  document.addEventListener('keydown', rememberScrollState, true);
+  document.addEventListener('dragstart', rememberScrollState, true);
+  document.addEventListener('drop', rememberScrollState, true);
+
   document.querySelectorAll('.nav-btn').forEach(btn => {
     btn.onclick = () => setView(btn.dataset.view);
   });
@@ -3668,10 +4950,21 @@ function initControls() {
 
   document.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
-      closeImportanceMenu();
-      closeMilestoneMenu();
-      closeAlbumLightbox();
-      closeTaskNotebook();
+      if (!$('modal-bg').classList.contains('hidden')) {
+        closeModal();
+        return;
+      }
+      if ($('importance-menu') || $('milestone-menu') || $('category-menu') || $('album-lightbox') || $('task-notebook')) {
+        closeImportanceMenu();
+        closeMilestoneMenu();
+        closeCategoryMenu();
+        closeAlbumLightbox();
+        closeTaskNotebook();
+        return;
+      }
+      e.preventDefault();
+      goBack();
+      return;
     }
     if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
     const k = e.key.toLowerCase();
