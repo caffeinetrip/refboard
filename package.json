@@ -22,8 +22,14 @@
       "output": "dist"
     },
     "win": {
+      "icon": "build/icon.ico",
       "target": [
-        { "target": "portable", "arch": ["x64"] }
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
       ]
     },
     "nsis": {

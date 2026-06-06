@@ -2276,6 +2276,42 @@ body {
   flex-wrap: wrap;
 }
 
+.note-add-float {
+  position: fixed;
+  right: 28px;
+  bottom: 22px;
+  z-index: 40;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  max-width: calc(100vw - 320px);
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: rgba(20, 22, 25, .94);
+  box-shadow: var(--shadow);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(8px);
+  transition: opacity .12s ease, transform .12s ease;
+}
+
+.note-add-float.show {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
+}
+
+@media (max-width: 720px) {
+  .note-add-float {
+    left: 14px;
+    right: 14px;
+    bottom: 14px;
+    max-width: none;
+  }
+}
+
 .media-attachments {
   display: flex;
   flex-wrap: wrap;

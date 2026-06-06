@@ -16,7 +16,7 @@ try {
   decompressFrames = null;
 }
 
-const APP_VERSION = 6;
+const APP_VERSION = 7;
 const APP_TYPE = 'game-analysis-library';
 
 const $ = id => document.getElementById(id);
@@ -50,27 +50,7 @@ function sessionCacheClear() {
 process.on('exit', sessionCacheClear);
 
 function defaultQuestionTemplates() {
-  return [
-    ['q_core_loop', 'Core loop', 'What does the player repeat again and again?', 'Design'],
-    ['q_run_length', 'Run length', 'How long is one run, wave, attempt, or cycle?', 'Structure'],
-    ['q_in_run_progress', 'In-run progress', 'What gives a sense of progress during the run?', 'Progress'],
-    ['q_next_run', 'Next run', 'What makes the player start one more run?', 'Progress'],
-    ['q_win_fail', 'Win / fail state', 'How does the game handle victory, failure, score, or soft failure?', 'Design'],
-    ['q_meta_progression', 'Meta progression', 'What does the player get between runs?', 'Progress'],
-    ['q_relics', 'Relics / upgrades', 'How do items, relics, symbols, upgrades, and synergies work?', 'Systems'],
-    ['q_pacing', 'Pacing', 'Where are the spikes, valleys, boring moments, and wow moments?', 'Feel'],
-    ['q_ui_ux', 'UI / UX', 'What is instantly clear, and what creates friction?', 'UX'],
-    ['q_polish', 'Polish', 'Which animations, sounds, effects, and feedback are worth remembering?', 'Polish'],
-    ['q_steal', 'Steal this', 'What can be adapted for your own game?', 'Takeaways'],
-    ['q_avoid', 'Avoid this', 'What should definitely not be repeated?', 'Takeaways'],
-  ].map((row, order) => ({
-    id: row[0],
-    title: row[1],
-    prompt: row[2],
-    category: row[3],
-    enabled: true,
-    order,
-  }));
+  return [];
 }
 
 const IMPORTANCE_LEVELS = [
@@ -88,6 +68,19 @@ const KANBAN_COLUMNS = [
   ['done', 'Done'],
 ];
 
+const GAME_TABS = ['notes', 'photos', 'videos', 'sound'];
+
+function normalizeGameTab(tab) {
+  return GAME_TABS.includes(tab) ? tab : 'notes';
+}
+
+function gameWithoutQuestions(game) {
+  const clean = { ...game };
+  delete clean.answers;
+  delete clean.collapsedQuestions;
+  return clean;
+}
+
 function freshState() {
   return {
     projectPath: null,
@@ -95,7 +88,7 @@ function freshState() {
     modified: false,
     view: 'library',
     activeGameId: null,
-    activeTab: 'questions',
+    activeTab: 'notes',
     activeMediaId: null,
     activeDailyNoteId: null,
     activePhotoBoardId: null,
@@ -110,7 +103,7 @@ function freshState() {
     dailyNotes: [],
     photoBoards: [],
     projects: [],
-    questionTemplates: defaultQuestionTemplates(),
+    questionTemplates: [],
     games: [],
     media: [],
   };
@@ -1402,6 +1395,7 @@ function closeModal() {
 }
 
 function setView(view, options = {}) {
+  if (view === 'templates') view = 'library';
   if (S.view !== 'game' || view !== 'game') stopViewer();
   closeAlbumLightbox();
   closeTaskNotebook();
@@ -1416,7 +1410,8 @@ function setView(view, options = {}) {
   renderApp();
 }
 
-function openGame(gameId, tab = 'questions', options = {}) {
+function openGame(gameId, tab = 'notes', options = {}) {
+  tab = normalizeGameTab(tab);
   stopViewer();
   if (!options.skipHistory && (S.view !== 'game' || S.activeGameId !== gameId || S.activeTab !== tab)) pushRoute();
   S.view = 'game';
@@ -1427,10 +1422,11 @@ function openGame(gameId, tab = 'questions', options = {}) {
 }
 
 function renderApp() {
+  if (S.view === 'templates') S.view = 'library';
+  S.activeTab = normalizeGameTab(S.activeTab);
   updateChrome();
   renderMiniGames();
-  if (S.view === 'templates') renderTemplates();
-  else if (S.view === 'game') renderGameWorkspace();
+  if (S.view === 'game') renderGameWorkspace();
   else if (S.view === 'daily-notes') renderDailyNotes();
   else if (S.view === 'photo-boards') renderPhotoBoards();
   else if (S.view === 'projects') renderProjects();
@@ -1453,7 +1449,7 @@ function renderMiniGames() {
     const row = document.createElement('div');
     row.className = 'mini-game' + (S.activeGameId === game.id && S.view === 'game' ? ' active' : '');
     row.innerHTML = `<span class="mini-dot"></span><span class="mini-title">${esc(game.title)}</span>`;
-    row.onclick = () => openGame(game.id, S.activeTab || 'questions');
+    row.onclick = () => openGame(game.id, S.activeTab || 'notes');
     wrap.appendChild(row);
   });
 }
@@ -1469,7 +1465,6 @@ function renderLibrary() {
         </div>
         <div class="head-actions">
           <input class="text-input search-input" id="game-search" value="${esc(S.gameSearch || '')}" placeholder="Search">
-          <button class="ghost-btn" id="library-templates">Templates</button>
           <button class="inline-btn" id="library-new-game">+ Game</button>
         </div>
       </div>
@@ -1477,7 +1472,6 @@ function renderLibrary() {
     </section>`;
 
   $('library-new-game').onclick = createGameFlow;
-  $('library-templates').onclick = () => setView('templates');
   $('game-search').oninput = e => {
     S.gameSearch = e.target.value;
     scheduleScrollRestore();
@@ -3445,9 +3439,9 @@ function renderGameWorkspace() {
     return;
   }
   ensureGameShape(game);
+  S.activeTab = normalizeGameTab(S.activeTab);
 
   const tabs = [
-    ['questions', 'Questions'],
     ['notes', 'Notes'],
     ['photos', 'Images'],
     ['videos', 'Video'],
@@ -3503,7 +3497,7 @@ function renderGameWorkspace() {
   else if (S.activeTab === 'photos') renderGameMediaGridTab(game, 'photo');
   else if (S.activeTab === 'videos') renderGameMediaGridTab(game, 'video');
   else if (S.activeTab === 'sound') renderMediaTab(game, 'sound');
-  else renderQuestionsTab(game);
+  else renderNotesTab(game);
 }
 
 function renderQuestionsTab(game) {
@@ -3594,22 +3588,28 @@ function renderNotesTab(game) {
   hidePlayback();
   game.notes = ensureBlockContainerShape(game.notes);
   $('tab-content').innerHTML = `
-    <div class="tab-scroll">
+    <div class="tab-scroll" id="game-notes-scroll">
       <div class="toolbar">
         <div class="toolbar-left">
           <div>
             <div class="eyebrow">Notes</div>
           </div>
         </div>
-        <div class="toolbar-right">
-          <button class="ghost-btn" id="add-note-text">+ Text</button>
-          <button class="ghost-btn" id="add-note-image">+ Photo</button>
-          <button class="ghost-btn" id="add-note-sound">+ Sound</button>
-          <button class="ghost-btn" id="add-note-video">+ Video</button>
+        <div class="toolbar-right note-add-top" id="note-add-top">
+          <button class="ghost-btn" data-note-add="text">+ Text</button>
+          <button class="ghost-btn" data-note-add="photo">+ Photo</button>
+          <button class="ghost-btn" data-note-add="sound">+ Sound</button>
+          <button class="ghost-btn" data-note-add="video">+ Video</button>
         </div>
       </div>
       ${blockCategoryControlsHTML(game.notes, 'game-note')}
       <div class="notes-list" id="notes-list"></div>
+      <div class="note-add-float" id="note-add-float" aria-hidden="true">
+        <button class="ghost-btn" data-note-add="text">+ Text</button>
+        <button class="ghost-btn" data-note-add="photo">+ Photo</button>
+        <button class="ghost-btn" data-note-add="sound">+ Sound</button>
+        <button class="ghost-btn" data-note-add="video">+ Video</button>
+      </div>
     </div>`;
 
   bindBlockCategoryControls(game.notes, 'game-note', shouldRender => {
@@ -3617,7 +3617,7 @@ function renderNotesTab(game) {
     markDirty();
     if (shouldRender) renderNotesTab(game);
   });
-  $('add-note-text').onclick = () => {
+  const addTextNote = () => {
     game.notes = ensureBlockContainerShape(game.notes);
     const block = createTextBlock();
     block.categoryId = getActiveBlockCategory(game.notes).id;
@@ -3626,9 +3626,27 @@ function renderNotesTab(game) {
     markDirty();
     renderNotesTab(game);
   };
-  $('add-note-image').onclick = () => addNoteMedia(game, 'photo');
-  $('add-note-sound').onclick = () => addNoteMedia(game, 'sound');
-  $('add-note-video').onclick = () => addNoteMedia(game, 'video');
+  $('tab-content').querySelectorAll('[data-note-add]').forEach(btn => {
+    btn.onclick = () => {
+      const kind = btn.dataset.noteAdd;
+      if (kind === 'text') addTextNote();
+      else addNoteMedia(game, kind);
+    };
+  });
+  const syncFloatingNoteAdd = () => {
+    const scrollEl = $('game-notes-scroll');
+    const topAdd = $('note-add-top');
+    const floatAdd = $('note-add-float');
+    if (!scrollEl || !topAdd || !floatAdd) return;
+    const scrollRect = scrollEl.getBoundingClientRect();
+    const topRect = topAdd.getBoundingClientRect();
+    const topVisible = topRect.bottom > scrollRect.top + 4 && topRect.top < scrollRect.bottom - 4;
+    const canScroll = scrollEl.scrollHeight > scrollEl.clientHeight + 4;
+    const shouldShow = canScroll && !topVisible;
+    floatAdd.classList.toggle('show', shouldShow);
+    floatAdd.setAttribute('aria-hidden', shouldShow ? 'false' : 'true');
+  };
+  $('game-notes-scroll').addEventListener('scroll', syncFloatingNoteAdd, { passive: true });
 
   renderEditableBlocks($('notes-list'), game.notes.blocks, {
     ownerName: 'game-note',
@@ -3648,6 +3666,7 @@ function renderNotesTab(game) {
       renderNotesTab(game);
     },
   }, { categoryId: getActiveBlockCategory(game.notes).id });
+  requestAnimationFrame(syncFloatingNoteAdd);
 }
 
 function renderMediaTab(game, kind) {
@@ -4013,15 +4032,13 @@ function createGameFlow() {
       link: '',
       iconMediaId: null,
       coverMediaId: null,
-      answers: {},
       notes: { blocks: [] },
-      collapsedQuestions: [],
       createdAt: now(),
       updatedAt: now(),
     });
     S.games.push(game);
     S.activeGameId = game.id;
-    S.activeTab = 'questions';
+    S.activeTab = 'notes';
     S.view = 'game';
     markDirty();
     renderApp();
@@ -4287,8 +4304,7 @@ function serializeProject() {
     dailyNotes: S.dailyNotes,
     photoBoards: S.photoBoards,
     projects: S.projects,
-    questionTemplates: S.questionTemplates,
-    games: S.games,
+    games: S.games.map(gameWithoutQuestions),
     media: S.media,
   };
 }
@@ -4335,18 +4351,16 @@ function loadProjectData(data, fp) {
   next.modified = false;
 
   if (data.type === APP_TYPE && Number(data.version || 0) >= 2) {
-    next.questionTemplates = Array.isArray(data.questionTemplates) && data.questionTemplates.length
-      ? data.questionTemplates
-      : defaultQuestionTemplates();
-    next.games = Array.isArray(data.games) ? data.games.map(ensureGameShape) : [];
+    next.questionTemplates = [];
+    next.games = Array.isArray(data.games) ? data.games.map(ensureGameShape).map(gameWithoutQuestions) : [];
     next.dailyNotes = Array.isArray(data.dailyNotes) ? data.dailyNotes.map(ensureDailyNoteShape) : [];
     next.photoBoards = Array.isArray(data.photoBoards) ? data.photoBoards.map(ensurePhotoBoardShape) : [];
     next.projects = Array.isArray(data.projects) ? data.projects.map(ensureProjectShape) : [];
     next.media = Array.isArray(data.media) ? data.media.map(ensureMediaShape) : [];
   } else {
     const migrated = migrateV1ToV2(data, next.projectName);
-    next.questionTemplates = migrated.questionTemplates;
-    next.games = migrated.games.map(ensureGameShape);
+    next.questionTemplates = [];
+    next.games = migrated.games.map(ensureGameShape).map(gameWithoutQuestions);
     next.media = migrated.media.map(ensureMediaShape);
     next.dailyNotes = [];
     next.photoBoards = [];
@@ -4355,7 +4369,7 @@ function loadProjectData(data, fp) {
 
   next.view = 'library';
   next.activeGameId = null;
-  next.activeTab = 'questions';
+  next.activeTab = 'notes';
   next.activeMediaId = null;
   next.activeDailyNoteId = null;
   next.activePhotoBoardId = null;
@@ -4377,9 +4391,7 @@ function migrateV1ToV2(data, projectName) {
     status: 'imported',
     link: '',
     coverMediaId: null,
-    answers: {},
     notes: { blocks: [] },
-    collapsedQuestions: [],
     createdAt: now(),
     updatedAt: now(),
   });
@@ -4415,7 +4427,7 @@ function migrateV1ToV2(data, projectName) {
       });
     });
   });
-  return { questionTemplates: defaultQuestionTemplates(), games: [game], media };
+  return { questionTemplates: [], games: [game], media };
 }
 
 function saveProject() {
