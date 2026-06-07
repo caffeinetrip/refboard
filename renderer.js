@@ -1,6 +1,6 @@
 'use strict';
 
-const { ipcRenderer, clipboard } = require('electron');
+const { ipcRenderer, clipboard, webUtils } = require('electron');
 const nodePath = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -16,8 +16,12 @@ try {
   decompressFrames = null;
 }
 
-const APP_VERSION = 7;
+const APP_VERSION = 8;
 const APP_TYPE = 'game-analysis-library';
+const DAILIES_EPOCH = '2026-06-07';
+const MOODBOARD_WORLD_MARGIN = 90000;
+const MOODBOARD_WORLD_MIN_WIDTH = 240000;
+const MOODBOARD_WORLD_MIN_HEIGHT = 180000;
 
 const $ = id => document.getElementById(id);
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -68,6 +72,13 @@ const KANBAN_COLUMNS = [
   ['done', 'Done'],
 ];
 
+const DAILY_COLUMNS = [
+  ['todo', 'Todo'],
+  ['done', 'Done'],
+];
+
+const DAILY_TABS = ['today', 'defaults', 'calendar'];
+
 const GAME_TABS = ['notes', 'photos', 'videos', 'sound'];
 
 function normalizeGameTab(tab) {
@@ -83,6 +94,7 @@ function gameWithoutQuestions(game) {
 
 function freshState() {
   return {
+    createdAt: now(),
     projectPath: null,
     projectName: 'Untitled',
     modified: false,
@@ -96,10 +108,18 @@ function freshState() {
     activeProjectTab: 'doc',
     activeMilestoneId: null,
     activeKanbanBoardId: null,
+    activeDailyDate: null,
+    dailyCalendarMonth: null,
+    activeMoodboardId: null,
     gameSearch: '',
     dailySearch: '',
     photoSearch: '',
     projectSearch: '',
+    noteSearch: '',
+    notes: null,
+    dailies: null,
+    moodboard: null,
+    drawing: null,
     dailyNotes: [],
     photoBoards: [],
     projects: [],
@@ -129,6 +149,9 @@ let V = {
   gifTimer: null,
   gifTotalDuration: 0,
   tlDragging: false,
+  moodboardHistory: [],
+  moodboardSelection: [],
+  moodboardViewportReady: {},
 };
 
 let activeGifCache = null;
@@ -180,8 +203,35 @@ function getActiveKanbanBoard(milestone) {
   return milestone.boards.find(board => board.id === S.activeKanbanBoardId) || milestone.boards[0] || null;
 }
 
+function dateToISO(value) {
+  const date = value instanceof Date ? new Date(value) : new Date(value || Date.now());
+  if (Number.isNaN(date.getTime())) return todayISO();
+  date.setMinutes(date.getMinutes() - date.getTimezoneOffset());
+  return date.toISOString().slice(0, 10);
+}
+
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
+  return dateToISO(new Date());
+}
+
+function addDaysISO(value, amount) {
+  const date = new Date(String(value || todayISO()) + 'T00:00:00');
+  date.setDate(date.getDate() + amount);
+  return dateToISO(date);
+}
+
+function daysBetweenISO(from, to) {
+  const start = new Date(String(from || todayISO()) + 'T00:00:00');
+  const end = new Date(String(to || todayISO()) + 'T00:00:00');
+  return Math.round((end - start) / 86400000);
+}
+
+function monthISO(value = todayISO()) {
+  return String(value || todayISO()).slice(0, 7);
+}
+
+function maxISODate(a, b) {
+  return String(a || '') > String(b || '') ? a : b;
 }
 
 function formatDateTitle(value) {
@@ -221,6 +271,7 @@ const SCROLL_KEEP_SELECTORS = [
   '.masonry-grid',
   '.kanban-columns',
   '.task-list',
+  '.moodboard-viewport',
 ];
 
 function scrollKeyFor(el, selector, index) {
@@ -529,6 +580,7 @@ function ensureTaskShape(task) {
   task.importance = importanceLevel(task.importance).id;
   task.mediaIds ??= [];
   task.mediaIds = Array.isArray(task.mediaIds) ? task.mediaIds : [];
+  task.completedAt ??= null;
   task.createdAt ??= now();
   task.updatedAt ??= now();
   return task;
@@ -539,7 +591,11 @@ function ensureKanbanBoardShape(board) {
   board.title ??= 'Board';
   board.columns ??= {};
   KANBAN_COLUMNS.forEach(([key]) => {
-    board.columns[key] = Array.isArray(board.columns[key]) ? board.columns[key].map(ensureTaskShape) : [];
+    board.columns[key] = Array.isArray(board.columns[key]) ? board.columns[key].map(task => {
+      const next = ensureTaskShape(task);
+      if (key === 'done' && !next.completedAt) next.completedAt = next.updatedAt || next.createdAt || now();
+      return next;
+    }) : [];
   });
   board.createdAt ??= now();
   board.updatedAt ??= now();
@@ -616,6 +672,490 @@ function ensureBlockContainerShape(container) {
     if (!container.categories.some(category => sameId(category.id, block.categoryId))) block.categoryId = container.categories[0].id;
   });
   return container;
+}
+
+function ensureNotesShape(notes) {
+  notes = ensureBlockContainerShape(notes || { blocks: [] });
+  notes.id ??= 'notes';
+  notes.title ??= 'Notes';
+  notes.categoryOpen = notes.categoryOpen === true;
+  notes.createdAt ??= now();
+  notes.updatedAt ??= now();
+  return notes;
+}
+
+function notesFromLegacyDailyNotes(dailyNotes) {
+  const notes = ensureNotesShape({ blocks: [] });
+  const source = Array.isArray(dailyNotes) ? dailyNotes : [];
+  if (!source.length) return notes;
+  notes.categories = [];
+  source
+    .map(ensureDailyNoteShape)
+    .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')))
+    .forEach(note => {
+      const category = ensureBlockCategoryShape({
+        id: 'blockcat_' + uid(),
+        title: note.title || formatDateTitle(note.date),
+        createdAt: note.createdAt || now(),
+        updatedAt: note.updatedAt || now(),
+      });
+      notes.categories.push(category);
+      (note.blocks || []).forEach(block => {
+        const next = ensureBlockShape({ ...block });
+        next.id = 'legacy_' + uid();
+        next.categoryId = category.id;
+        notes.blocks.push(next);
+      });
+    });
+  if (!notes.categories.length) notes.categories = [defaultBlockCategory()];
+  notes.activeCategoryId = notes.categories[0].id;
+  return ensureNotesShape(notes);
+}
+
+function createDailyTemplate(title = 'Daily quest') {
+  return ensureDailyTemplateShape({
+    id: 'dt_' + uid(),
+    title,
+    notes: '',
+    importance: 'common',
+    enabled: true,
+    order: S.dailies?.templates?.length || 0,
+    createdAt: now(),
+    updatedAt: now(),
+  });
+}
+
+function ensureDailyTemplateShape(template, index = 0) {
+  template.id ??= 'dt_' + uid();
+  template.title ??= 'Daily quest';
+  template.notes ??= '';
+  template.importance = importanceLevel(template.importance).id;
+  template.enabled = template.enabled !== false;
+  template.order = Number.isFinite(Number(template.order)) ? Number(template.order) : index;
+  template.createdAt ??= now();
+  template.updatedAt ??= now();
+  return template;
+}
+
+function createDailyQuest(title = 'Daily quest', source = 'manual') {
+  return ensureDailyQuestShape({
+    id: 'dq_' + uid(),
+    title,
+    notes: '',
+    importance: 'common',
+    source,
+    sourceTemplateId: null,
+    completedAt: null,
+    createdAt: now(),
+    updatedAt: now(),
+  });
+}
+
+function createDailyQuestFromTemplate(template) {
+  ensureDailyTemplateShape(template);
+  return ensureDailyQuestShape({
+    id: 'dq_' + uid(),
+    title: template.title,
+    notes: template.notes || '',
+    importance: template.importance || 'common',
+    source: 'default',
+    sourceTemplateId: template.id,
+    completedAt: null,
+    createdAt: now(),
+    updatedAt: now(),
+  });
+}
+
+function ensureDailyQuestShape(quest) {
+  quest.id ??= 'dq_' + uid();
+  quest.title ??= 'Daily quest';
+  quest.notes ??= '';
+  quest.importance = importanceLevel(quest.importance).id;
+  quest.source ??= 'manual';
+  quest.sourceTemplateId ??= null;
+  quest.completedAt ??= null;
+  quest.createdAt ??= now();
+  quest.updatedAt ??= now();
+  return quest;
+}
+
+function createDailyDay(date = todayISO()) {
+  const day = ensureDailyDayShape({
+    id: 'dd_' + date,
+    date,
+    title: formatDateTitle(date),
+    journal: '',
+    status: 'open',
+    columns: { todo: [], done: [], extra: [] },
+    celebratedAt: null,
+    createdAt: now(),
+    updatedAt: now(),
+  });
+  const templates = [...(S.dailies?.templates || [])]
+    .map(ensureDailyTemplateShape)
+    .filter(template => template.enabled !== false)
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  day.columns.todo = templates.map(createDailyQuestFromTemplate);
+  return day;
+}
+
+function ensureDailyDayShape(day) {
+  day.id ??= 'dd_' + (day.date || todayISO());
+  day.date ??= todayISO();
+  day.title ??= formatDateTitle(day.date);
+  day.journal ??= '';
+  day.status ??= 'open';
+  day.celebratedAt ??= null;
+  day.columns ??= {};
+  if (Array.isArray(day.columns.need) && day.columns.need.length) {
+    day.columns.todo = [...day.columns.need, ...(Array.isArray(day.columns.todo) ? day.columns.todo : [])];
+    delete day.columns.need;
+  }
+  day.columns.extra = Array.isArray(day.columns.extra) ? day.columns.extra.map(ensureDailyQuestShape) : [];
+  DAILY_COLUMNS.forEach(([key]) => {
+    day.columns[key] = Array.isArray(day.columns[key]) ? day.columns[key].map(ensureDailyQuestShape) : [];
+    const extras = day.columns[key].filter(quest => quest.source === 'extra');
+    if (extras.length) {
+      day.columns.extra.push(...extras);
+      day.columns[key] = day.columns[key].filter(quest => quest.source !== 'extra');
+    }
+  });
+  day.createdAt ??= now();
+  day.updatedAt ??= now();
+  return day;
+}
+
+function ensureDailiesShape(dailies) {
+  if (!dailies || typeof dailies !== 'object') dailies = {};
+  dailies.enabled = dailies.enabled !== false;
+  dailies.disabledAt ??= null;
+  dailies.pausedRanges = Array.isArray(dailies.pausedRanges)
+    ? dailies.pausedRanges
+      .map(range => ({
+        from: dateToISO(range.from || todayISO()),
+        to: dateToISO(range.to || range.from || todayISO()),
+      }))
+      .filter(range => String(range.from) <= String(range.to))
+    : [];
+  dailies.activeTab = DAILY_TABS.includes(dailies.activeTab) ? dailies.activeTab : 'today';
+  dailies.templates = Array.isArray(dailies.templates)
+    ? dailies.templates.map(ensureDailyTemplateShape).sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+    : [];
+  dailies.days = Array.isArray(dailies.days)
+    ? dailies.days.map(ensureDailyDayShape)
+    : [];
+  dailies.createdAt ??= S.createdAt || now();
+  dailies.lastEnsuredDate ??= null;
+  dailies.updatedAt ??= now();
+  return dailies;
+}
+
+function ensureMoodboardShape(board) {
+  if (!board || typeof board !== 'object') board = {};
+  board.id ??= 'moodboard';
+  if (!Array.isArray(board.boards) || !board.boards.length) {
+    board.boards = [ensureMoodboardBoardShape({
+      id: 'mb_' + uid(),
+      title: 'Board 1',
+      items: Array.isArray(board.items) ? board.items : [],
+      zoom: board.zoom || 1,
+      createdAt: board.createdAt || now(),
+      updatedAt: board.updatedAt || now(),
+    })];
+  } else {
+    board.boards = board.boards.map((item, index) => ensureMoodboardBoardShape(item, index));
+  }
+  delete board.items;
+  board.activeBoardId ??= board.boards[0]?.id || null;
+  if (!board.boards.some(item => sameId(item.id, board.activeBoardId))) board.activeBoardId = board.boards[0]?.id || null;
+  board.boardOpen = board.boardOpen === true;
+  board.createdAt ??= now();
+  board.updatedAt ??= now();
+  return board;
+}
+
+function ensureMoodboardBoardShape(board, index = 0) {
+  if (!board || typeof board !== 'object') board = {};
+  board.id ??= 'mb_' + uid();
+  board.title ??= index ? 'Moodboard' : 'Board 1';
+  board.items = Array.isArray(board.items) ? board.items.map(ensureMoodboardItemShape) : [];
+  board.zoom = clampNumber(board.zoom, 1, .1, 8);
+  board.originX = clampNumber(board.originX, MOODBOARD_WORLD_MARGIN, 1000, 10000000);
+  board.originY = clampNumber(board.originY, MOODBOARD_WORLD_MARGIN, 1000, 10000000);
+  board.createdAt ??= now();
+  board.updatedAt ??= now();
+  return board;
+}
+
+function ensureMoodboardItemShape(item) {
+  item.id ??= 'mbi_' + uid();
+  item.mediaId ??= null;
+  item.x = clampNumber(item.x, 80, -50000, 500000);
+  item.y = clampNumber(item.y, 80, -50000, 500000);
+  item.w = clampNumber(item.w, 260, 80, 20000);
+  item.h = clampNumber(item.h, 190, 80, 20000);
+  item.z = clampNumber(item.z, 1, 1, 999999);
+  item.createdAt ??= now();
+  item.updatedAt ??= now();
+  return item;
+}
+
+function getActiveMoodboard() {
+  S.moodboard = ensureMoodboardShape(S.moodboard);
+  const activeId = S.activeMoodboardId || S.moodboard.activeBoardId;
+  let board = S.moodboard.boards.find(item => sameId(item.id, activeId));
+  if (!board) board = S.moodboard.boards[0] || null;
+  if (board) {
+    S.moodboard.activeBoardId = board.id;
+    S.activeMoodboardId = board.id;
+  }
+  return board;
+}
+
+function ensureDrawingShape(drawing) {
+  if (!drawing || typeof drawing !== 'object') drawing = {};
+  drawing.id ??= 'drawing';
+  drawing.title ??= 'Drawing';
+  drawing.categoryOpen = drawing.categoryOpen === true;
+  ensureMediaCategoryBucket(drawing, 'photo');
+  drawing.createdAt ??= now();
+  drawing.updatedAt ??= now();
+  return drawing;
+}
+
+function clampNumber(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, number));
+}
+
+function ensureWorkspaceShape() {
+  S.notes = ensureNotesShape(S.notes);
+  S.dailies = ensureDailiesShape(S.dailies);
+  S.moodboard = ensureMoodboardShape(S.moodboard);
+  S.drawing = ensureDrawingShape(S.drawing);
+  S.activeDailyDate ??= todayISO();
+  S.dailyCalendarMonth ??= monthISO(S.activeDailyDate || todayISO());
+}
+
+function getDailiesStartDate() {
+  const raw = S.createdAt || S.dailies?.createdAt || now();
+  const created = dateToISO(raw);
+  return maxISODate(created, DAILIES_EPOCH);
+}
+
+function isDailiesPausedDate(date) {
+  if (S.dailies?.enabled === false && S.dailies.disabledAt && String(date) >= String(S.dailies.disabledAt) && String(date) <= String(todayISO())) {
+    return true;
+  }
+  return (S.dailies?.pausedRanges || []).some(range => (
+    String(date) >= String(range.from) && String(date) <= String(range.to)
+  ));
+}
+
+function countDailiesTrackDays(start, end) {
+  let count = 0;
+  let date = start;
+  let guard = 0;
+  while (String(date) <= String(end) && guard < 5000) {
+    if (!isDailiesPausedDate(date)) count += 1;
+    date = addDaysISO(date, 1);
+    guard += 1;
+  }
+  return count;
+}
+
+function setDailiesEnabled(enabled) {
+  ensureWorkspaceShape();
+  const today = todayISO();
+  if (!enabled && S.dailies.enabled) {
+    S.dailies.enabled = false;
+    S.dailies.disabledAt = today;
+  } else if (enabled && !S.dailies.enabled) {
+    const from = S.dailies.disabledAt;
+    const to = addDaysISO(today, -1);
+    if (from && String(from) <= String(to)) {
+      S.dailies.pausedRanges.push({ from, to });
+    }
+    S.dailies.disabledAt = null;
+    S.dailies.enabled = true;
+    ensureDailiesReady();
+  }
+  S.dailies.updatedAt = now();
+  markDirty();
+}
+
+function dailyStats(day) {
+  ensureDailyDayShape(day);
+  const externalDone = collectExternalDailyTasks(day.date).length;
+  const extraTotal = (day.columns.extra || []).length;
+  const extraDone = (day.columns.extra || []).filter(quest => quest.completedAt).length;
+  const routineTotal = DAILY_COLUMNS.reduce((sum, [key]) => sum + (day.columns[key] || []).length, 0);
+  const routineDone = (day.columns.done || []).length;
+  const dailyTotal = routineTotal + extraTotal;
+  const dailyDone = routineDone + extraDone;
+  const total = dailyTotal + externalDone;
+  const done = dailyDone + externalDone;
+  const pct = total ? Math.round((done / total) * 100) : 0;
+  return {
+    total,
+    done,
+    dailyTotal,
+    dailyDone,
+    routineTotal,
+    routineDone,
+    extraTotal,
+    extraDone,
+    externalDone,
+    todo: (day.columns.todo || []).length,
+    extraTodo: Math.max(0, extraTotal - extraDone),
+    pct,
+    complete: total > 0 && done >= total,
+  };
+}
+
+function syncDailyDayStatus(day, today = todayISO()) {
+  ensureDailyDayShape(day);
+  const before = day.status;
+  const stats = dailyStats(day);
+  if (stats.complete) day.status = 'complete';
+  else if (String(day.date) < String(today)) day.status = 'failed';
+  else day.status = 'open';
+  if (before !== day.status) {
+    day.updatedAt = now();
+    return true;
+  }
+  return false;
+}
+
+function ensureDailiesReady(options = {}) {
+  ensureWorkspaceShape();
+  if (!S.dailies.enabled) return false;
+  const today = todayISO();
+  const start = getDailiesStartDate();
+  let date = start;
+  let changed = false;
+  let guard = 0;
+  while (String(date) <= String(today) && guard < 5000) {
+    if (isDailiesPausedDate(date)) {
+      date = addDaysISO(date, 1);
+      guard += 1;
+      continue;
+    }
+    let day = S.dailies.days.find(item => item.date === date);
+    if (!day) {
+      day = createDailyDay(date);
+      S.dailies.days.push(day);
+      changed = true;
+    }
+    if (syncDailyDayStatus(day, today)) changed = true;
+    date = addDaysISO(date, 1);
+    guard += 1;
+  }
+  S.dailies.days.sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+  if (S.dailies.lastEnsuredDate !== today) {
+    S.dailies.lastEnsuredDate = today;
+    changed = true;
+  }
+  if (changed) {
+    S.dailies.updatedAt = now();
+    if (options.dirty !== false) markDirty();
+  }
+  return changed;
+}
+
+function getDailyDay(date) {
+  ensureWorkspaceShape();
+  return S.dailies.days.find(day => day.date === date) || null;
+}
+
+function getOrCreateDailyDay(date) {
+  ensureWorkspaceShape();
+  const cleanDate = date || todayISO();
+  let day = getDailyDay(cleanDate);
+  if (!day) {
+    day = createDailyDay(cleanDate);
+    S.dailies.days.push(day);
+    syncDailyDayStatus(day);
+    S.dailies.updatedAt = now();
+    markDirty();
+  }
+  return day;
+}
+
+function taskCompletedISO(task) {
+  if (!task?.completedAt) return null;
+  return dateToISO(task.completedAt);
+}
+
+function collectExternalDailyTasks(date = todayISO()) {
+  const targetDate = dateToISO(date);
+  const tasks = [];
+  (S.projects || []).forEach(project => {
+    (project.milestones || []).forEach(milestone => {
+      (milestone.boards || []).forEach(board => {
+        (board.columns?.done || []).forEach(task => {
+          if (taskCompletedISO(task) !== targetDate) return;
+          tasks.push({
+            id: `${project.id}:${milestone.id}:${board.id}:${task.id}`,
+            title: task.title || 'Task',
+            importance: importanceLevel(task.importance).id,
+            projectTitle: project.title || 'Project',
+            milestoneTitle: milestone.title || 'Milestone',
+            boardTitle: board.title || 'Board',
+            completedAt: task.completedAt,
+          });
+        });
+      });
+    });
+  });
+  return tasks.sort((a, b) => String(b.completedAt || '').localeCompare(String(a.completedAt || '')));
+}
+
+function dailiesProgressStats() {
+  ensureWorkspaceShape();
+  const today = todayISO();
+  const start = getDailiesStartDate();
+  const days = S.dailies.days
+    .map(ensureDailyDayShape)
+    .filter(day => String(day.date) >= String(start) && String(day.date) <= String(today) && !isDailiesPausedDate(day.date));
+  days.forEach(day => syncDailyDayStatus(day, today));
+  const complete = days.filter(day => day.status === 'complete').length;
+  const failed = days.filter(day => day.status === 'failed').length;
+  const open = days.filter(day => day.status === 'open').length;
+  const counted = complete + failed;
+  const successRate = counted ? Math.round((complete / counted) * 100) : 0;
+  let currentStreak = 0;
+  let cursor = today;
+  const todayDay = days.find(day => day.date === today);
+  if (!todayDay || todayDay.status !== 'complete') cursor = addDaysISO(cursor, -1);
+  while (String(cursor) >= String(start)) {
+    const day = days.find(item => item.date === cursor);
+    if (!day || day.status !== 'complete') break;
+    currentStreak += 1;
+    cursor = addDaysISO(cursor, -1);
+  }
+  let bestStreak = 0;
+  let run = 0;
+  [...days].sort((a, b) => String(a.date).localeCompare(String(b.date))).forEach(day => {
+    if (day.status === 'complete') {
+      run += 1;
+      bestStreak = Math.max(bestStreak, run);
+    } else if (day.status === 'failed') {
+      run = 0;
+    }
+  });
+  return {
+    start,
+    today,
+    total: countDailiesTrackDays(start, today),
+    complete,
+    failed,
+    open,
+    successRate,
+    currentStreak,
+    bestStreak,
+  };
 }
 
 function getActiveBlockCategory(container) {
@@ -1242,6 +1782,9 @@ function routeSnapshot() {
     activeProjectTab: S.activeProjectTab,
     activeMilestoneId: S.activeMilestoneId,
     activeKanbanBoardId: S.activeKanbanBoardId,
+    activeDailyDate: S.activeDailyDate,
+    dailyCalendarMonth: S.dailyCalendarMonth,
+    activeMoodboardId: S.activeMoodboardId,
   };
 }
 
@@ -1394,6 +1937,48 @@ function closeModal() {
   modalCb = null;
 }
 
+function returnToViewRoot(view) {
+  ensureWorkspaceShape();
+  if (view === 'daily-notes' && S.notes?.categoryOpen) {
+    S.notes.categoryOpen = false;
+    S.notes.updatedAt = now();
+    markDirty();
+    renderApp();
+    return true;
+  }
+  if (view === 'drawing' && S.drawing?.categoryOpen) {
+    S.drawing.categoryOpen = false;
+    S.drawing.updatedAt = now();
+    markDirty();
+    renderApp();
+    return true;
+  }
+  if (view === 'moodboard' && S.moodboard?.boardOpen) {
+    S.moodboard.boardOpen = false;
+    S.moodboard.updatedAt = now();
+    clearMoodboardSelection();
+    markDirty();
+    renderApp();
+    return true;
+  }
+  if (view === 'photo-boards' && S.activePhotoBoardId) {
+    S.activePhotoBoardId = null;
+    renderApp();
+    return true;
+  }
+  if (view === 'projects' && S.activeProjectId) {
+    S.activeProjectId = null;
+    renderApp();
+    return true;
+  }
+  return false;
+}
+
+function handleMainNavClick(view) {
+  if (S.view === view && returnToViewRoot(view)) return;
+  setView(view);
+}
+
 function setView(view, options = {}) {
   if (view === 'templates') view = 'library';
   if (S.view !== 'game' || view !== 'game') stopViewer();
@@ -1406,6 +1991,11 @@ function setView(view, options = {}) {
   if (view === 'daily-notes') S.activeDailyNoteId = null;
   if (view === 'photo-boards') S.activePhotoBoardId = null;
   if (view === 'projects') S.activeProjectId = null;
+  if (view === 'dailies') {
+    S.activeDailyDate ??= todayISO();
+    S.dailyCalendarMonth ??= monthISO(S.activeDailyDate);
+  }
+  if (view === 'drawing') S.activeMediaId = null;
   S.view = view;
   renderApp();
 }
@@ -1424,10 +2014,15 @@ function openGame(gameId, tab = 'notes', options = {}) {
 function renderApp() {
   if (S.view === 'templates') S.view = 'library';
   S.activeTab = normalizeGameTab(S.activeTab);
+  ensureWorkspaceShape();
+  ensureDailiesReady();
   updateChrome();
   renderMiniGames();
   if (S.view === 'game') renderGameWorkspace();
-  else if (S.view === 'daily-notes') renderDailyNotes();
+  else if (S.view === 'daily-notes') renderNotes();
+  else if (S.view === 'dailies') renderDailies();
+  else if (S.view === 'moodboard') renderMoodboard();
+  else if (S.view === 'drawing') renderDrawing();
   else if (S.view === 'photo-boards') renderPhotoBoards();
   else if (S.view === 'projects') renderProjects();
   else renderLibrary();
@@ -1508,6 +2103,195 @@ function renderLibraryCards() {
   body.innerHTML = '<div class="games-grid" id="games-grid"></div>';
   const grid = $('games-grid');
   games.forEach(game => grid.appendChild(buildGameCard(game)));
+}
+
+function renderNotes() {
+  stopViewer();
+  hidePlayback();
+  S.notes = ensureNotesShape(S.notes);
+  if (!S.notes.categoryOpen) {
+    renderNotesCategoryLibrary();
+    return;
+  }
+  renderNotesCategoryDetail();
+}
+
+function renderNotesCategoryLibrary() {
+  S.notes = ensureNotesShape(S.notes);
+  $('main').innerHTML = `
+    <section class="screen">
+      <div class="screen-head">
+        <div class="title-wrap">
+          <h1 class="screen-title">Notes</h1>
+        </div>
+        <div class="head-actions">
+          <button class="inline-btn" id="notes-new-category">+ Category</button>
+        </div>
+      </div>
+      <div class="screen-scroll" id="notes-category-body"></div>
+    </section>`;
+
+  $('notes-new-category').onclick = () => addBlockCategory(S.notes, () => {
+    S.notes.categoryOpen = true;
+    S.notes.updatedAt = now();
+    markDirty();
+    renderNotes();
+  });
+
+  const body = $('notes-category-body');
+  if (!S.notes.categories.length) {
+    body.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-box">
+          <div class="empty-title">Empty</div>
+          <button class="inline-btn" id="notes-empty-category">+ Category</button>
+        </div>
+      </div>`;
+    $('notes-empty-category').onclick = $('notes-new-category').onclick;
+    return;
+  }
+  body.innerHTML = '<div class="category-card-grid" id="notes-category-grid"></div>';
+  const grid = $('notes-category-grid');
+  S.notes.categories.forEach(category => {
+    const count = S.notes.blocks.filter(block => blockMatchesCategory(block, category.id)).length;
+    const card = document.createElement('button');
+    card.className = 'category-card';
+    card.innerHTML = `
+      <div class="category-card-mark">N</div>
+      <div class="category-card-main">
+        <div class="category-card-title">${esc(category.title)}</div>
+        <div class="card-sub">${count} notes</div>
+      </div>`;
+    card.onclick = () => {
+      S.notes.activeCategoryId = category.id;
+      S.notes.categoryOpen = true;
+      S.notes.updatedAt = now();
+      markDirty();
+      renderNotes();
+    };
+    grid.appendChild(card);
+  });
+}
+
+function renderNotesCategoryDetail() {
+  S.notes = ensureNotesShape(S.notes);
+  const category = getActiveBlockCategory(S.notes);
+  $('main').innerHTML = `
+    <section class="screen">
+      <div class="screen-head roomy-head">
+        <div class="title-wrap">
+          <input id="notes-category-title" class="section-title-input" value="${esc(category.title)}">
+        </div>
+        <div class="head-actions">
+          <button class="ghost-btn" id="notes-back-categories">Categories</button>
+          <button class="ghost-btn" id="global-note-text">+ Text</button>
+          <button class="ghost-btn" id="global-note-photo">+ Photo</button>
+          <button class="ghost-btn" id="global-note-sound">+ Sound</button>
+          <button class="ghost-btn" id="global-note-video">+ Video</button>
+          <button class="danger-btn" id="notes-delete-category">Delete Category</button>
+        </div>
+      </div>
+      <div class="tab-scroll">
+        <div class="category-action-row">
+          <button class="ghost-btn" id="global-note-sort-importance">Sort importance</button>
+          <button class="ghost-btn" id="global-note-copy-category">Copy category</button>
+          <button class="ghost-btn" id="global-note-copy-all">Copy all</button>
+        </div>
+        <div class="notes-list" id="global-notes-list"></div>
+      </div>
+    </section>`;
+
+  $('notes-back-categories').onclick = () => {
+    S.notes.categoryOpen = false;
+    S.notes.updatedAt = now();
+    markDirty();
+    renderNotes();
+  };
+  $('notes-category-title').oninput = e => {
+    category.title = e.target.value;
+    category.updatedAt = now();
+    S.notes.updatedAt = now();
+    markDirty();
+  };
+  $('notes-delete-category').onclick = () => deleteNotesCategory(category);
+  $('global-note-sort-importance').onclick = () => {
+    sortBlocksByImportance(S.notes, category.id);
+    S.notes.updatedAt = now();
+    markDirty();
+    renderNotes();
+  };
+  $('global-note-copy-category').onclick = () => copyBlockContainerToClipboard(S.notes, category.id);
+  $('global-note-copy-all').onclick = () => copyBlockContainerToClipboard(S.notes);
+  $('global-note-text').onclick = () => {
+    const block = createTextBlock();
+    block.categoryId = category.id;
+    S.notes.blocks.push(block);
+    S.notes.updatedAt = now();
+    markDirty();
+    renderNotes();
+  };
+  $('global-note-photo').onclick = () => addGlobalNoteMedia('photo');
+  $('global-note-sound').onclick = () => addGlobalNoteMedia('sound');
+  $('global-note-video').onclick = () => addGlobalNoteMedia('video');
+
+  renderEditableBlocks($('global-notes-list'), S.notes.blocks, {
+    ownerName: 'notes',
+    onChange: () => {
+      S.notes.updatedAt = now();
+      markDirty();
+    },
+    onDelete: block => {
+      S.notes.blocks = S.notes.blocks.filter(item => item.id !== block.id);
+      S.notes.updatedAt = now();
+      markDirty();
+      renderNotes();
+    },
+    onReorder: () => {
+      S.notes.updatedAt = now();
+      markDirty();
+      renderNotes();
+    },
+  }, { categoryId: getActiveBlockCategory(S.notes).id });
+}
+
+function deleteNotesCategory(category) {
+  if (S.notes.categories.length <= 1) {
+    toast('Keep one category');
+    return;
+  }
+  if (!confirm(`Delete category "${category.title}"?`)) return;
+  S.notes.blocks = S.notes.blocks.filter(block => !blockMatchesCategory(block, category.id));
+  S.notes.categories = S.notes.categories.filter(item => !sameId(item.id, category.id));
+  S.notes.activeCategoryId = S.notes.categories[0]?.id || null;
+  S.notes.categoryOpen = false;
+  S.notes.updatedAt = now();
+  markDirty();
+  renderNotes();
+}
+
+async function addGlobalNoteMedia(kind) {
+  S.notes = ensureNotesShape(S.notes);
+  const files = await pickMediaFiles(kind);
+  if (!files.length) return;
+  files.forEach(fp => {
+    const media = registerMediaFile(fp, S.notes.id, kind, 'notes');
+    if (media) S.notes.blocks.push({
+      id: uid(),
+      type: 'media',
+      mediaId: media.id,
+      title: media.name,
+      caption: '',
+      importance: 'common',
+      categoryId: getActiveBlockCategory(S.notes).id,
+      height: 270,
+      createdAt: now(),
+      updatedAt: now(),
+    });
+  });
+  S.notes.updatedAt = now();
+  markDirty();
+  renderNotes();
+  toast(`Added: ${files.length}`);
 }
 
 function renderDailyNotes() {
@@ -1962,6 +2746,848 @@ async function addDailyNoteMedia(note) {
   renderDailyNoteWorkspace(note);
 }
 
+function renderDailies() {
+  stopViewer();
+  hidePlayback();
+  ensureWorkspaceShape();
+  ensureDailiesReady();
+  const stats = dailiesProgressStats();
+  const activeTab = S.dailies.activeTab || 'today';
+  $('main').innerHTML = `
+    <section class="screen dailies-screen simple-dailies-screen">
+      <div class="screen-head">
+        <div class="title-wrap">
+          <h1 class="screen-title">Dailies</h1>
+        </div>
+        <div class="head-actions">
+          <span class="daily-compact-stat">${stats.currentStreak} streak</span>
+          <span class="daily-compact-stat">${stats.bestStreak} best</span>
+          <span class="daily-compact-stat">${stats.complete}/${stats.total} days</span>
+          <span class="daily-compact-stat">${stats.successRate}% success</span>
+          <button class="${S.dailies.enabled ? 'inline-btn' : 'danger-btn'}" id="toggle-dailies">
+            ${S.dailies.enabled ? 'On' : 'Off'}
+          </button>
+        </div>
+      </div>
+      <div class="dailies-shell">
+        <div class="tabs dailies-tabs">
+          ${[
+            ['today', 'Today'],
+            ['defaults', 'Defaults'],
+            ['calendar', 'Calendar'],
+          ].map(([id, label]) => `<button class="tab-btn ${activeTab === id ? 'active' : ''}" data-daily-tab="${id}">${label}</button>`).join('')}
+        </div>
+        <div class="dailies-content" id="dailies-content"></div>
+      </div>
+    </section>`;
+
+  $('toggle-dailies').onclick = () => {
+    setDailiesEnabled(!S.dailies.enabled);
+    renderDailies();
+  };
+  document.querySelectorAll('[data-daily-tab]').forEach(btn => {
+    btn.onclick = () => {
+      S.dailies.activeTab = btn.dataset.dailyTab;
+      S.dailies.updatedAt = now();
+      markDirty();
+      renderDailies();
+    };
+  });
+
+  const content = $('dailies-content');
+  if (!S.dailies.enabled) renderDailiesDisabled(content);
+  else if (activeTab === 'defaults') renderDailyDefaults(content);
+  else if (activeTab === 'calendar') renderDailyCalendar(content);
+  else renderDailyToday(content);
+}
+
+function renderDailiesDisabled(content) {
+  content.innerHTML = `
+    <div class="empty-state compact-empty">
+      <div class="empty-box">
+        <div class="empty-title">Dailies are off</div>
+        <div class="empty-text">No new daily days will be created while this is disabled.</div>
+        <button class="inline-btn" id="enable-dailies">Enable</button>
+      </div>
+    </div>`;
+  $('enable-dailies').onclick = () => {
+    setDailiesEnabled(true);
+    renderDailies();
+  };
+}
+
+function renderDailyToday(content) {
+  const day = getOrCreateDailyDay(todayISO());
+  S.activeDailyDate = day.date;
+  S.dailyCalendarMonth = monthISO(day.date);
+  renderDailyDayPanel(content, day, 'today');
+}
+
+function dailyExternalWorkHTML(date) {
+  const items = collectExternalDailyTasks(date);
+  if (!items.length) {
+    return `
+      <div class="daily-external-work empty">
+        <div class="daily-side-title">Done elsewhere</div>
+        <div class="daily-side-empty">Tasks moved to Done on this day will appear here.</div>
+      </div>`;
+  }
+  return `
+    <div class="daily-external-work">
+      <div class="daily-side-title">Done elsewhere <span>${items.length}</span></div>
+      <div class="daily-external-list">
+        ${items.slice(0, 8).map(item => `
+          <div class="daily-external-item task-importance-${esc(item.importance)}">
+            <strong>${esc(item.title)}</strong>
+            <small>${esc(item.projectTitle)} / ${esc(item.boardTitle)}</small>
+          </div>`).join('')}
+      </div>
+    </div>`;
+}
+
+function renderDailyExtraList(day, host, rerender) {
+  if (!host) return;
+  ensureDailyDayShape(day);
+  const extras = day.columns.extra || [];
+  host.innerHTML = '';
+  if (!extras.length) {
+    host.innerHTML = '<div class="daily-side-empty">No extra tasks for this day.</div>';
+    return;
+  }
+  extras.forEach(quest => host.appendChild(buildDailyExtraCard(day, quest, rerender)));
+}
+
+function buildDailyExtraCard(day, quest, rerender) {
+  ensureDailyQuestShape(quest);
+  const done = !!quest.completedAt;
+  const card = document.createElement('div');
+  card.className = `task-card daily-task-card daily-extra-card task-importance-${esc(importanceLevel(quest.importance).id)}${done ? ' done' : ''}`;
+  card.draggable = true;
+  card.addEventListener('dragstart', e => {
+    if (e.target.closest('input, textarea, button, .rarity-badge')) { e.preventDefault(); return; }
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('application/x-refboard-daily-task', JSON.stringify({
+      date: day.date,
+      columnKey: 'extra',
+      taskId: quest.id,
+    }));
+    card.classList.add('dragging');
+  });
+  card.addEventListener('dragend', () => card.classList.remove('dragging'));
+  card.innerHTML = `
+    <div class="task-card-top daily-task-top">
+      ${importanceBadgeHTML(quest.importance)}
+      <input class="daily-task-title-input daily-extra-title" value="${esc(quest.title || '')}">
+      <button class="mini-btn daily-extra-toggle">${done ? 'Return' : 'Done'}</button>
+    </div>
+    <textarea class="daily-task-notes daily-extra-notes" placeholder="Extra note...">${esc(quest.notes || '')}</textarea>
+    <div class="daily-task-foot">
+      <span>${done ? 'done' : 'extra'}</span>
+      <button class="mini-btn danger-lite daily-extra-delete">Delete</button>
+    </div>`;
+  bindImportanceTriggers(card, () => quest.importance, value => {
+    quest.importance = value;
+    touchDailyDay(day);
+    markDirty();
+    rerender();
+  });
+  card.querySelector('.daily-extra-title').oninput = e => {
+    quest.title = e.target.value;
+    quest.updatedAt = now();
+    touchDailyDay(day);
+    markDirty();
+  };
+  card.querySelector('.daily-extra-notes').oninput = e => {
+    quest.notes = e.target.value;
+    quest.updatedAt = now();
+    touchDailyDay(day);
+    markDirty();
+  };
+  card.querySelector('.daily-extra-toggle').onclick = () => toggleDailyExtraQuest(day, quest.id, rerender);
+  card.querySelector('.daily-extra-delete').onclick = () => {
+    if (!confirm(`Delete "${quest.title}"?`)) return;
+    day.columns.extra = (day.columns.extra || []).filter(item => item.id !== quest.id);
+    updateDailyCompletion(day);
+    touchDailyDay(day);
+    markDirty();
+    rerender();
+    // Re-render kanban if open so button reactivates
+    if (S.view === 'projects' && S.activeProjectId) {
+      const project = S.projects.find(p => p.id === S.activeProjectId);
+      if (project) renderProjectWorkspace(project);
+    }
+  };
+  return card;
+}
+
+
+function isKanbanTaskLinkedToExtras(taskId) {
+  return (S.dailies?.days || []).some(day =>
+    (day.columns?.extra || []).some(q => q.sourceRef === taskId)
+  );
+}
+
+function addKanbanTaskToTodayExtras(task) {
+  // Prevent duplicate across all days
+  if (isKanbanTaskLinkedToExtras(task.id)) {
+    toast('Already in Today extras');
+    return;
+  }
+  const day = getOrCreateDailyDay(todayISO());
+  ensureDailyDayShape(day);
+  const quest = createDailyQuest(task.title || 'Task', 'extra');
+  quest.importance = task.importance || 'common';
+  quest.notes = task.notes || '';
+  quest.sourceRef = task.id;
+  day.columns.extra.push(quest);
+  updateDailyCompletion(day);
+  touchDailyDay(day);
+  markDirty();
+  // Re-render kanban card to show disabled state
+  if (S.view === 'projects') {
+    const btn = document.querySelector(`.task-to-today-btn[data-task-id="${task.id}"]`);
+    if (btn) { btn.textContent = '✓ Added'; btn.disabled = true; btn.classList.add('added'); }
+  }
+  toast('Added to Today ✓');
+}
+function addDailyExtraQuestFlow(day, rerender) {
+  askText('Extra Daily Task', '', 'Create', title => {
+    const quest = createDailyQuest(title, 'extra');
+    quest.importance = 'common';
+    ensureDailyDayShape(day);
+    day.columns.extra.push(quest);
+    updateDailyCompletion(day);
+    touchDailyDay(day);
+    markDirty();
+    rerender();
+  });
+}
+
+function toggleDailyExtraQuest(day, questId, rerender) {
+  ensureDailyDayShape(day);
+  const quest = (day.columns.extra || []).find(item => item.id === questId);
+  if (!quest) return;
+  const beforeStats = dailyStats(day);
+  const willDone = !quest.completedAt;
+  quest.completedAt = willDone ? now() : null;
+  quest.updatedAt = now();
+  touchDailyDay(day);
+  updateDailyCompletion(day, beforeStats, quest, willDone ? 'done' : 'extra');
+  // Sync with linked kanban task
+  if (quest.sourceRef && willDone) syncKanbanTaskDone(quest.sourceRef);
+  markDirty();
+  rerender();
+}
+
+function syncExtraQuestDone(taskId) {
+  if (!S.dailies?.days) return;
+  ensureDailiesReady({ dirty: false });
+  for (const day of (S.dailies.days || [])) {
+    ensureDailyDayShape(day);
+    const quest = (day.columns.extra || []).find(q => q.sourceRef === taskId && !q.completedAt);
+    if (quest) {
+      const beforeStats = dailyStats(day);
+      quest.completedAt = now();
+      quest.updatedAt = now();
+      touchDailyDay(day);
+      updateDailyCompletion(day, beforeStats, quest, 'done');
+      markDirty();
+      return;
+    }
+  }
+}
+
+function syncKanbanTaskDone(taskId) {
+  const nonDoneCols = KANBAN_COLUMNS.map(([k]) => k).filter(k => k !== 'done');
+  for (const project of (S.projects || [])) {
+    for (const milestone of (project.milestones || [])) {
+      for (const board of (milestone.boards || [])) {
+        // ensure board has columns
+        if (!board.columns) continue;
+        for (const col of nonDoneCols) {
+          const tasks = board.columns[col] || [];
+          const task = tasks.find(t => t.id === taskId);
+          if (task) {
+            // move without triggering daily XP again (pass silent flag)
+            board.columns[col] = tasks.filter(t => t.id !== taskId);
+            if (!Array.isArray(board.columns.done)) board.columns.done = [];
+            board.columns.done.push(task);
+            task.completedAt = now();
+            task.updatedAt = now();
+            board.updatedAt = now();
+            milestone.updatedAt = now();
+            touchProject(project);
+            markDirty();
+            // re-render if project is currently open
+            if (S.view === 'projects' && S.activeProjectId === project.id) {
+              renderProjectWorkspace(project);
+            }
+            return;
+          }
+        }
+      }
+    }
+  }
+}
+
+function renderDailyExtras(content) {
+  const days = [...S.dailies.days]
+    .map(ensureDailyDayShape)
+    .filter(day => (day.columns.extra || []).length)
+    .sort((a, b) => String(b.date || '').localeCompare(String(a.date || '')));
+  content.innerHTML = `
+    <div class="daily-extras-page">
+      <div class="toolbar daily-extras-toolbar">
+        <div class="toolbar-left">
+          <div class="eyebrow">Extra tasks</div>
+        </div>
+        <div class="toolbar-right">
+          <button class="inline-btn" id="daily-extras-add">+ Today extra</button>
+        </div>
+      </div>
+      <div class="daily-extras-list" id="daily-extras-list"></div>
+    </div>`;
+  $('daily-extras-add').onclick = () => addDailyExtraQuestFlow(getOrCreateDailyDay(todayISO()), () => renderDailies());
+  const list = $('daily-extras-list');
+  if (!days.length) {
+    list.innerHTML = `
+      <div class="empty-state compact-empty">
+        <div class="empty-box">
+          <div class="empty-title">No extra tasks</div>
+          <button class="inline-btn" id="daily-extras-empty-add">+ Today extra</button>
+        </div>
+      </div>`;
+    $('daily-extras-empty-add').onclick = $('daily-extras-add').onclick;
+    return;
+  }
+  days.forEach(day => {
+    const stats = dailyStats(day);
+    const section = document.createElement('section');
+    section.className = 'daily-extra-day';
+    section.innerHTML = `
+      <div class="daily-extra-day-head">
+        <div>
+          <div class="eyebrow">${esc(day.date)}</div>
+          <h3>${esc(formatDateTitle(day.date))}</h3>
+        </div>
+        <span>${stats.extraDone}/${stats.extraTotal}</span>
+      </div>
+      <div class="daily-extra-day-list"></div>`;
+    renderDailyExtraList(day, section.querySelector('.daily-extra-day-list'), () => renderDailies());
+    list.appendChild(section);
+  });
+}
+
+function renderDailyDayPanel(content, day, prefix) {
+  ensureDailyDayShape(day);
+  syncDailyDayStatus(day);
+  const stats = dailyStats(day);
+  content.innerHTML = `
+    <div class="daily-day-layout daily-day-layout-wide">
+      <section class="daily-board-panel daily-board-full">
+        <div class="daily-day-head">
+          <div>
+            <div class="eyebrow">${esc(formatDateTitle(day.date))}</div>
+            <h2 class="daily-day-title">${esc(day.title || formatDateTitle(day.date))}</h2>
+          </div>
+          <div class="daily-head-actions">
+            <div class="daily-status daily-status-${esc(day.status)}">${esc(day.status)}</div>
+            <span class="daily-mini-summary">
+              <span>${stats.todo} todo</span>
+              <span>${stats.dailyDone} done</span>
+              <span>${stats.extraDone}/${stats.extraTotal} extra</span>
+            </span>
+          </div>
+        </div>
+        <div class="daily-simple-progress"><span style="width:${stats.pct}%"></span><strong>${stats.done} / ${stats.total}</strong></div>
+        <div class="daily-kanban-wrap" id="${esc(prefix)}-daily-board"></div>
+      </section>
+      <aside class="daily-journal-panel daily-journal-compact">
+        ${dailyExternalWorkHTML(day.date)}
+        <div class="field">
+          <label class="field-label">Day comment</label>
+          <textarea class="text-area daily-journal" id="${esc(prefix)}-daily-journal" placeholder="How did this day go?">${esc(day.journal || '')}</textarea>
+        </div>
+      </aside>
+    </div>`;
+  $(`${prefix}-daily-journal`).oninput = e => {
+    day.journal = e.target.value;
+    day.updatedAt = now();
+    S.dailies.updatedAt = now();
+    markDirty();
+  };
+  renderDailyKanban(day, $(`${prefix}-daily-board`), () => renderDailies());
+}
+
+function renderDailyKanban(day, host, rerender) {
+  if (!host) return;
+  ensureDailyDayShape(day);
+  host.innerHTML = '<div class="kanban-columns daily-columns"></div>';
+  const columns = host.querySelector('.daily-columns');
+
+  // All columns: extras first, then todo, done
+  const allColumns = [
+    ['extra', 'Extra'],
+    ...DAILY_COLUMNS,
+  ];
+
+  allColumns.forEach(([key, label]) => {
+    const col = document.createElement('section');
+    const isExtra = key === 'extra';
+    col.className = `kanban-column daily-column daily-column-${key}${isExtra ? ' daily-column-extra-kanban' : ''}`;
+    const quests = day.columns[key] || [];
+    col.innerHTML = `
+      <div class="kanban-column-head">
+        <span>${esc(label)}</span>
+        <span class="kanban-column-tools">
+          <button class="column-sort-btn" data-sort-daily="${esc(key)}">Sort</button>
+          <span class="column-count">${quests.length}</span>
+        </span>
+      </div>
+      <button class="mini-add-task" data-add-daily="${esc(key)}">+ ${isExtra ? 'Extra' : 'Quest'}</button>
+      <div class="task-list" data-daily-column="${esc(key)}"></div>`;
+
+    col.querySelector('[data-add-daily]').onclick = () => {
+      if (isExtra) addDailyExtraQuestFlow(day, rerender);
+      else addDailyQuestFlow(day, key, rerender);
+    };
+    col.querySelector('[data-sort-daily]').onclick = () => {
+      sortByImportance(day.columns[key]);
+      touchDailyDay(day);
+      markDirty();
+      rerender();
+    };
+    const taskList = col.querySelector('.task-list');
+    taskList.addEventListener('dragover', e => {
+      e.preventDefault();
+      col.classList.add('drag-over');
+    });
+    taskList.addEventListener('dragleave', () => col.classList.remove('drag-over'));
+    taskList.addEventListener('drop', e => {
+      e.preventDefault();
+      col.classList.remove('drag-over');
+      const payload = JSON.parse(e.dataTransfer.getData('application/x-refboard-daily-task') || '{}');
+      if (!payload.taskId || payload.date !== day.date) return;
+      if (isExtra) {
+        // Move to extra column
+        moveDailyQuestToExtra(day, payload.columnKey, payload.taskId, rerender);
+      } else if (payload.columnKey === 'extra') {
+        // Move from extra to regular column
+        moveDailyQuestFromExtra(day, payload.taskId, key, rerender);
+      } else {
+        moveDailyQuest(day, payload.columnKey, payload.taskId, key, rerender);
+      }
+    });
+
+    if (isExtra) {
+      quests.forEach(quest => taskList.appendChild(buildDailyExtraCard(day, quest, rerender)));
+    } else {
+      quests.forEach(quest => taskList.appendChild(buildDailyQuestCard(day, key, quest, rerender)));
+    }
+    columns.appendChild(col);
+  });
+}
+
+function moveDailyQuestToExtra(day, fromColumn, taskId, rerender) {
+  if (fromColumn === 'extra') return;
+  const list = day.columns[fromColumn] || [];
+  const quest = list.find(item => item.id === taskId);
+  if (!quest) return;
+  day.columns[fromColumn] = list.filter(item => item.id !== taskId);
+  quest.source = 'extra';
+  quest.completedAt = null;
+  quest.updatedAt = now();
+  day.columns.extra = day.columns.extra || [];
+  day.columns.extra.push(quest);
+  touchDailyDay(day);
+  markDirty();
+  rerender();
+}
+
+function moveDailyQuestFromExtra(day, taskId, toColumn, rerender) {
+  const list = day.columns.extra || [];
+  const quest = list.find(item => item.id === taskId);
+  if (!quest) return;
+  day.columns.extra = list.filter(item => item.id !== taskId);
+  quest.source = 'manual';
+  if (toColumn === 'done') quest.completedAt = now();
+  else quest.completedAt = null;
+  quest.updatedAt = now();
+  day.columns[toColumn] = day.columns[toColumn] || [];
+  day.columns[toColumn].push(quest);
+  touchDailyDay(day);
+  markDirty();
+  rerender();
+}
+
+function buildDailyQuestCard(day, columnKey, quest, rerender) {
+  ensureDailyQuestShape(quest);
+  const card = document.createElement('div');
+  card.className = `task-card daily-task-card task-importance-${esc(importanceLevel(quest.importance).id)}`;
+  card.draggable = true;
+  card.addEventListener('dragstart', e => {
+    if (e.target.closest('input, textarea, button, .rarity-badge')) {
+      e.preventDefault();
+      return;
+    }
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('application/x-refboard-daily-task', JSON.stringify({
+      date: day.date,
+      columnKey,
+      taskId: quest.id,
+    }));
+    card.classList.add('dragging');
+  });
+  card.addEventListener('dragend', () => card.classList.remove('dragging'));
+  const nextColumn = columnKey === 'done' ? 'todo' : 'done';
+  const actionLabel = columnKey === 'done' ? 'Return' : 'Done';
+  card.innerHTML = `
+    <div class="task-card-top daily-task-top">
+      ${importanceBadgeHTML(quest.importance)}
+      <input class="daily-task-title-input" value="${esc(quest.title || '')}">
+      <button class="mini-btn daily-complete-btn">${esc(actionLabel)}</button>
+    </div>
+    <textarea class="daily-task-notes" placeholder="Quest note...">${esc(quest.notes || '')}</textarea>
+    <div class="daily-task-foot">
+      <span>${quest.source === 'default' ? 'default' : 'manual'}</span>
+      <button class="mini-btn danger-lite daily-delete-quest">Delete</button>
+    </div>`;
+  bindImportanceTriggers(card, () => quest.importance, value => {
+    quest.importance = value;
+    touchDailyDay(day);
+    markDirty();
+    rerender();
+  });
+  card.querySelector('.daily-task-title-input').oninput = e => {
+    quest.title = e.target.value;
+    quest.updatedAt = now();
+    touchDailyDay(day);
+    markDirty();
+  };
+  card.querySelector('.daily-task-notes').oninput = e => {
+    quest.notes = e.target.value;
+    quest.updatedAt = now();
+    touchDailyDay(day);
+    markDirty();
+  };
+  card.querySelector('.daily-complete-btn').onclick = () => moveDailyQuest(day, columnKey, quest.id, nextColumn, rerender);
+  card.querySelector('.daily-delete-quest').onclick = () => {
+    if (!confirm(`Delete "${quest.title}"?`)) return;
+    day.columns[columnKey] = (day.columns[columnKey] || []).filter(item => item.id !== quest.id);
+    updateDailyCompletion(day);
+    touchDailyDay(day);
+    markDirty();
+    rerender();
+  };
+  return card;
+}
+
+function addDailyQuestFlow(day, columnKey, rerender) {
+  askText('New Daily Quest', '', 'Create', title => {
+    const quest = createDailyQuest(title, 'manual');
+    quest.importance = 'common';
+    if (columnKey === 'done') quest.completedAt = now();
+    day.columns[columnKey].push(quest);
+    updateDailyCompletion(day);
+    touchDailyDay(day);
+    markDirty();
+    rerender();
+  });
+}
+
+function moveDailyQuest(day, fromColumn, taskId, toColumn, rerender) {
+  if (fromColumn === toColumn) return;
+  const list = day.columns[fromColumn] || [];
+  const quest = list.find(item => item.id === taskId);
+  if (!quest || !day.columns[toColumn]) return;
+  const beforeStats = dailyStats(day);
+  day.columns[fromColumn] = list.filter(item => item.id !== taskId);
+  day.columns[toColumn].push(quest);
+  quest.completedAt = toColumn === 'done' ? now() : null;
+  quest.updatedAt = now();
+  touchDailyDay(day);
+  updateDailyCompletion(day, beforeStats, quest, toColumn);
+  markDirty();
+  rerender();
+}
+
+function touchDailyDay(day) {
+  day.updatedAt = now();
+  S.dailies.updatedAt = now();
+  syncDailyDayStatus(day);
+}
+
+function updateDailyCompletion(day, beforeStats = dailyStats(day), quest = null, toColumn = null) {
+  const beforeComplete = beforeStats.complete;
+  syncDailyDayStatus(day);
+  const stats = dailyStats(day);
+  if (quest && toColumn === 'done') showDailyQuestDoneEffect(quest);
+  if (stats.total && stats.complete && !beforeComplete && !day.celebratedAt) {
+    day.celebratedAt = now();
+    showDailyAllDoneEffect(day);
+  }
+}
+
+function refreshDailyStatusForDate(date) {
+  if (!date || !S.dailies) return;
+  const day = getDailyDay(date);
+  if (!day) return;
+  syncDailyDayStatus(day);
+  day.updatedAt = now();
+  S.dailies.updatedAt = now();
+}
+
+function renderDailyDefaults(content) {
+  const templates = S.dailies.templates;
+  content.innerHTML = `
+    <div class="daily-defaults">
+      <div class="toolbar">
+        <div class="toolbar-left">
+          <div class="eyebrow">Default quests</div>
+        </div>
+        <div class="toolbar-right">
+          <button class="ghost-btn" id="apply-defaults-today">Apply to today</button>
+          <button class="inline-btn" id="add-daily-template">+ Quest</button>
+        </div>
+      </div>
+      <div class="daily-template-list" id="daily-template-list"></div>
+    </div>`;
+  $('add-daily-template').onclick = () => addDailyTemplateFlow();
+  $('apply-defaults-today').onclick = () => {
+    const added = applyDefaultTemplatesToDay(getOrCreateDailyDay(todayISO()));
+    markDirty();
+    renderDailies();
+    toast(added ? `Added: ${added}` : 'Already added');
+  };
+  const list = $('daily-template-list');
+  if (!templates.length) {
+    list.innerHTML = `
+      <div class="empty-state compact-empty">
+        <div class="empty-box">
+          <div class="empty-title">No defaults</div>
+          <button class="inline-btn" id="empty-add-daily-template">+ Quest</button>
+        </div>
+      </div>`;
+    $('empty-add-daily-template').onclick = () => addDailyTemplateFlow();
+    return;
+  }
+  templates.forEach((template, index) => {
+    const card = document.createElement('div');
+    card.className = `daily-template-card task-importance-${esc(importanceLevel(template.importance).id)}`;
+    card.innerHTML = `
+      <label class="check-wrap compact-check">
+        <input type="checkbox" class="daily-template-enabled" ${template.enabled !== false ? 'checked' : ''}>
+        Enabled
+      </label>
+      ${importanceBadgeHTML(template.importance)}
+      <input class="text-input daily-template-title" value="${esc(template.title || '')}">
+      <textarea class="text-area compact-prompt daily-template-notes" placeholder="Optional note...">${esc(template.notes || '')}</textarea>
+      <div class="card-actions">
+        <button class="mini-btn daily-template-up" ${index === 0 ? 'disabled' : ''}>Up</button>
+        <button class="mini-btn daily-template-down" ${index === templates.length - 1 ? 'disabled' : ''}>Down</button>
+        <button class="mini-btn danger-lite daily-template-delete">Delete</button>
+      </div>`;
+    bindImportanceTriggers(card, () => template.importance, value => {
+      template.importance = value;
+      template.updatedAt = now();
+      S.dailies.updatedAt = now();
+      markDirty();
+      renderDailies();
+    });
+    card.querySelector('.daily-template-enabled').onchange = e => {
+      template.enabled = e.target.checked;
+      template.updatedAt = now();
+      S.dailies.updatedAt = now();
+      markDirty();
+    };
+    card.querySelector('.daily-template-title').oninput = e => {
+      template.title = e.target.value;
+      template.updatedAt = now();
+      S.dailies.updatedAt = now();
+      markDirty();
+    };
+    card.querySelector('.daily-template-notes').oninput = e => {
+      template.notes = e.target.value;
+      template.updatedAt = now();
+      S.dailies.updatedAt = now();
+      markDirty();
+    };
+    card.querySelector('.daily-template-up').onclick = () => moveDailyTemplate(index, -1);
+    card.querySelector('.daily-template-down').onclick = () => moveDailyTemplate(index, 1);
+    card.querySelector('.daily-template-delete').onclick = () => {
+      if (!confirm(`Delete "${template.title}"?`)) return;
+      S.dailies.templates = S.dailies.templates.filter(item => item.id !== template.id);
+      normalizeDailyTemplateOrder();
+      S.dailies.updatedAt = now();
+      markDirty();
+      renderDailies();
+    };
+    list.appendChild(card);
+  });
+}
+
+function addDailyTemplateFlow() {
+  askText('New Default Quest', '', 'Create', title => {
+    S.dailies.templates.push(createDailyTemplate(title));
+    normalizeDailyTemplateOrder();
+    S.dailies.updatedAt = now();
+    markDirty();
+    renderDailies();
+  });
+}
+
+function normalizeDailyTemplateOrder() {
+  S.dailies.templates.forEach((template, index) => {
+    template.order = index;
+    template.updatedAt = now();
+  });
+}
+
+function moveDailyTemplate(index, offset) {
+  const to = index + offset;
+  if (to < 0 || to >= S.dailies.templates.length) return;
+  const [template] = S.dailies.templates.splice(index, 1);
+  S.dailies.templates.splice(to, 0, template);
+  normalizeDailyTemplateOrder();
+  S.dailies.updatedAt = now();
+  markDirty();
+  renderDailies();
+}
+
+function applyDefaultTemplatesToDay(day) {
+  const existing = new Set(DAILY_COLUMNS.flatMap(([key]) => (day.columns[key] || []).map(quest => quest.sourceTemplateId)).filter(Boolean));
+  let added = 0;
+  S.dailies.templates
+    .filter(template => template.enabled !== false)
+    .forEach(template => {
+      if (existing.has(template.id)) return;
+      day.columns.todo.push(createDailyQuestFromTemplate(template));
+      existing.add(template.id);
+      added += 1;
+    });
+  if (added) {
+    touchDailyDay(day);
+    S.dailies.updatedAt = now();
+  }
+  return added;
+}
+
+function renderDailyCalendar(content) {
+  const today = todayISO();
+  const start = getDailiesStartDate();
+  const month = S.dailyCalendarMonth || monthISO(today);
+  S.dailyCalendarMonth = month;
+  if (!S.activeDailyDate || String(S.activeDailyDate) < String(start) || String(S.activeDailyDate) > String(today)) {
+    S.activeDailyDate = today;
+  }
+  content.innerHTML = `
+    <div class="daily-calendar-layout">
+      <section class="daily-calendar-panel">
+        <div class="daily-calendar-head">
+          <button class="mini-btn" id="daily-month-prev">&lt;</button>
+          <div class="daily-calendar-title">${esc(formatCalendarMonth(month))}</div>
+          <button class="mini-btn" id="daily-month-next">&gt;</button>
+          <button class="ghost-btn" id="daily-month-today">Today</button>
+        </div>
+        <div class="daily-calendar-grid" id="daily-calendar-grid"></div>
+      </section>
+      <section class="daily-calendar-detail" id="daily-calendar-detail"></section>
+    </div>`;
+  $('daily-month-prev').onclick = () => {
+    S.dailyCalendarMonth = shiftMonthISO(month, -1);
+    renderDailies();
+  };
+  $('daily-month-next').onclick = () => {
+    S.dailyCalendarMonth = shiftMonthISO(month, 1);
+    renderDailies();
+  };
+  $('daily-month-today').onclick = () => {
+    S.activeDailyDate = today;
+    S.dailyCalendarMonth = monthISO(today);
+    renderDailies();
+  };
+  renderCalendarCells(month, start, today);
+  const selected = getOrCreateDailyDay(S.activeDailyDate);
+  renderDailyDayPanel($('daily-calendar-detail'), selected, 'calendar');
+}
+
+function renderCalendarCells(month, start, today) {
+  const grid = $('daily-calendar-grid');
+  const [year, monthIndex] = month.split('-').map(Number);
+  const first = new Date(year, monthIndex - 1, 1);
+  const daysInMonth = new Date(year, monthIndex, 0).getDate();
+  const offset = first.getDay();
+  grid.innerHTML = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+    .map(label => `<div class="calendar-weekday">${label}</div>`)
+    .join('');
+  for (let i = 0; i < offset; i++) {
+    const blank = document.createElement('div');
+    blank.className = 'calendar-day blank';
+    grid.appendChild(blank);
+  }
+  for (let dayNum = 1; dayNum <= daysInMonth; dayNum++) {
+    const date = `${year}-${String(monthIndex).padStart(2, '0')}-${String(dayNum).padStart(2, '0')}`;
+    const day = getDailyDay(date);
+    const stats = day ? dailyStats(day) : { total: 0, done: 0, pct: 0 };
+    const paused = isDailiesPausedDate(date);
+    const status = paused ? 'paused' : day ? day.status : String(date) < String(today) && String(date) >= String(start) ? 'failed' : 'empty';
+    const locked = paused || String(date) < String(start) || String(date) > String(today);
+    const cell = document.createElement('button');
+    cell.className = `calendar-day status-${status}${date === S.activeDailyDate ? ' active' : ''}${locked ? ' locked' : ''}`;
+    cell.disabled = locked;
+    cell.innerHTML = `
+      <span class="calendar-day-num">${dayNum}</span>
+      <span class="calendar-day-pct">${paused ? 'pause' : stats.total ? `${stats.done}/${stats.total}` : '-'}</span>`;
+    cell.onclick = () => {
+      S.activeDailyDate = date;
+      S.dailyCalendarMonth = monthISO(date);
+      getOrCreateDailyDay(date);
+      renderDailies();
+    };
+    grid.appendChild(cell);
+  }
+}
+
+function formatCalendarMonth(month) {
+  try {
+    return new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric' }).format(new Date(month + '-01T00:00:00'));
+  } catch (e) {
+    return month;
+  }
+}
+
+function shiftMonthISO(month, offset) {
+  const [year, monthIndex] = String(month || monthISO()).split('-').map(Number);
+  const date = new Date(year, monthIndex - 1 + offset, 1);
+  return monthISO(dateToISO(date));
+}
+
+function showDailyQuestDoneEffect(quest) {
+  const effect = document.createElement('div');
+  effect.className = 'daily-quest-effect';
+  effect.innerHTML = `
+    <span class="daily-effect-xp">+1 done</span>
+    <span class="daily-effect-title">${esc(quest.title || 'Done')}</span>`;
+  document.body.appendChild(effect);
+  setTimeout(() => effect.classList.add('show'), 20);
+  setTimeout(() => effect.remove(), 1200);
+}
+
+function showDailyAllDoneEffect(day) {
+  const old = $('daily-complete-effect');
+  if (old) old.remove();
+  const effect = document.createElement('div');
+  effect.id = 'daily-complete-effect';
+  effect.innerHTML = `
+    <div class="complete-burst daily-complete-burst">
+      <div class="complete-title">All Dailies Done</div>
+      <div class="complete-name">${esc(formatDateTitle(day.date))}</div>
+    </div>`;
+  document.body.appendChild(effect);
+  setTimeout(() => effect.classList.add('show'), 20);
+  setTimeout(() => effect.remove(), 1900);
+}
+
 function buildGameCard(game) {
   const card = document.createElement('div');
   card.className = 'game-card';
@@ -2260,6 +3886,1200 @@ async function addPhotosToBoard(board) {
   markDirty();
   renderPhotoBoardDetail(board);
   toast(`Added: ${files.length}`);
+}
+
+function getDrawingMedia() {
+  S.drawing = ensureDrawingShape(S.drawing);
+  return S.media
+    .map(ensureMediaShape)
+    .filter(media => media.gameId === S.drawing.id && media.scope === 'drawing' && media.kind === 'photo')
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || String(b.createdAt || '').localeCompare(String(a.createdAt || '')));
+}
+
+function renderDrawing() {
+  stopViewer();
+  hidePlayback();
+  S.drawing = ensureDrawingShape(S.drawing);
+  if (!S.drawing.categoryOpen) {
+    renderDrawingCategoryLibrary();
+    return;
+  }
+  renderDrawingCategoryDetail();
+}
+
+function renderDrawingCategoryLibrary() {
+  S.drawing = ensureDrawingShape(S.drawing);
+  $('main').innerHTML = `
+    <section class="screen">
+      <div class="screen-head">
+        <div class="title-wrap">
+          <h1 class="screen-title">Drawing</h1>
+        </div>
+        <div class="head-actions">
+          <button class="inline-btn" id="drawing-new-category">+ Category</button>
+        </div>
+      </div>
+      <div class="screen-scroll" id="drawing-category-body"></div>
+    </section>`;
+  $('drawing-new-category').onclick = () => createMediaCategoryFlow(S.drawing, 'photo', () => {
+    S.drawing.categoryOpen = true;
+    S.drawing.updatedAt = now();
+    markDirty();
+    renderDrawing();
+  });
+
+  const body = $('drawing-category-body');
+  const categories = getMediaCategories(S.drawing, 'photo');
+  body.innerHTML = '<div class="category-card-grid" id="drawing-category-grid"></div>';
+  const grid = $('drawing-category-grid');
+  categories.forEach(category => {
+    const items = getDrawingMedia().filter(item => item.categoryId === category.id);
+    const cover = items[0];
+    const card = document.createElement('button');
+    card.className = 'category-card media-category-card';
+    card.innerHTML = `
+      <div class="category-card-cover">${cover ? mediaPreviewHTML(cover, true) : 'R'}</div>
+      <div class="category-card-main">
+        <div class="category-card-title">${esc(category.title)}</div>
+        <div class="card-sub">${items.length} images</div>
+      </div>`;
+    card.onclick = () => {
+      setActiveMediaCategory(S.drawing, 'photo', category.id);
+      S.drawing.categoryOpen = true;
+      S.drawing.updatedAt = now();
+      markDirty();
+      renderDrawing();
+    };
+    grid.appendChild(card);
+  });
+}
+
+function renderDrawingCategoryDetail() {
+  S.drawing = ensureDrawingShape(S.drawing);
+  const activeCategory = getActiveMediaCategory(S.drawing, 'photo');
+  const items = getDrawingMedia().filter(item => item.categoryId === activeCategory.id);
+  $('main').innerHTML = `
+    <section class="screen">
+      <div class="screen-head roomy-head">
+        <div class="title-wrap">
+          <input id="drawing-category-title" class="section-title-input" value="${esc(activeCategory.title)}">
+        </div>
+        <div class="head-actions">
+          <button class="ghost-btn" id="drawing-back-categories">Categories</button>
+          <button class="ghost-btn" id="drawing-sort-media">Sort importance</button>
+          <button class="inline-btn" id="drawing-add-media">+ Images</button>
+          <button class="danger-btn" id="drawing-delete-category">Delete Category</button>
+        </div>
+      </div>
+      <div class="tab-scroll">
+        <div class="project-media-grid" id="drawing-media-grid"></div>
+      </div>
+    </section>`;
+
+  $('drawing-back-categories').onclick = () => {
+    S.drawing.categoryOpen = false;
+    S.drawing.updatedAt = now();
+    markDirty();
+    renderDrawing();
+  };
+  $('drawing-category-title').oninput = e => {
+    activeCategory.title = e.target.value;
+    activeCategory.updatedAt = now();
+    S.drawing.updatedAt = now();
+    markDirty();
+  };
+  $('drawing-delete-category').onclick = () => deleteDrawingCategory(activeCategory);
+  $('drawing-add-media').onclick = addDrawingMedia;
+  $('drawing-sort-media').onclick = () => {
+    const sortable = getDrawingMedia().filter(item => item.categoryId === activeCategory.id);
+    sortMediaByImportance(sortable);
+    S.drawing.updatedAt = now();
+    markDirty();
+    renderDrawing();
+  };
+
+  const grid = $('drawing-media-grid');
+  if (!items.length) {
+    grid.innerHTML = `<button class="album-drop-card fixed-drop" id="drawing-empty-media">+ Images</button>`;
+    $('drawing-empty-media').onclick = addDrawingMedia;
+    bindDrawingDrop(grid);
+    return;
+  }
+
+  items.forEach(item => {
+    const card = document.createElement('div');
+    card.className = 'album-photo-card fixed-media-card';
+    card.innerHTML = `
+      <button class="album-photo-open">${mediaPreviewHTML(item, true)}</button>
+      <div class="album-photo-foot">
+        ${importanceBadgeHTML(item.importance)}
+        <input class="album-photo-title" value="${esc(item.name)}">
+        <button class="mini-btn remove-drawing-media">x</button>
+      </div>`;
+    card.querySelector('.album-photo-open').onclick = () => openAlbumPhoto(item.id);
+    bindImportanceTriggers(card, () => item.importance, value => {
+      item.importance = value;
+      item.updatedAt = now();
+      S.drawing.updatedAt = now();
+      markDirty();
+      renderDrawing();
+    });
+    card.querySelector('.album-photo-title').oninput = e => {
+      item.name = e.target.value;
+      item.updatedAt = now();
+      S.drawing.updatedAt = now();
+      markDirty();
+    };
+    card.querySelector('.remove-drawing-media').onclick = () => removeDrawingMedia(item.id);
+    bindSortableIdCard(card, item.id, 'application/x-refboard-drawing-media', (draggedId, beforeId) => {
+      if (reorderMediaBefore(S.drawing.id, 'drawing', 'photo', activeCategory.id, draggedId, beforeId)) {
+        S.drawing.updatedAt = now();
+        markDirty();
+        renderDrawing();
+      }
+    });
+    grid.appendChild(card);
+  });
+
+  const add = document.createElement('button');
+  add.className = 'album-drop-card fixed-drop';
+  add.textContent = '+ Images';
+  add.onclick = addDrawingMedia;
+  grid.appendChild(add);
+  const spacer = document.createElement('div');
+  spacer.className = 'media-grid-spacer';
+  spacer.addEventListener('dragover', e => {
+    e.preventDefault();
+    if (hasMoveDragType(e, 'application/x-refboard-drawing-media')) spacer.classList.add('drag-over');
+  });
+  spacer.addEventListener('dragleave', () => spacer.classList.remove('drag-over'));
+  spacer.addEventListener('drop', e => {
+    e.preventDefault();
+    spacer.classList.remove('drag-over');
+    const draggedId = getDraggedId(e, 'application/x-refboard-drawing-media');
+    if (draggedId && reorderMediaBefore(S.drawing.id, 'drawing', 'photo', activeCategory.id, draggedId, null)) {
+      S.drawing.updatedAt = now();
+      markDirty();
+      renderDrawing();
+    }
+  });
+  grid.appendChild(spacer);
+  bindDrawingDrop(grid);
+}
+
+function deleteDrawingCategory(category) {
+  const categories = getMediaCategories(S.drawing, 'photo');
+  if (categories.length <= 1) {
+    toast('Keep one category');
+    return;
+  }
+  if (!confirm(`Delete category "${category.title}"?`)) return;
+  const mediaIds = new Set(getDrawingMedia().filter(item => item.categoryId === category.id).map(item => item.id));
+  S.media = S.media.filter(item => !mediaIds.has(item.id));
+  const [listKey, activeKey] = mediaCategoryConfig('photo');
+  S.drawing[listKey] = categories.filter(item => !sameId(item.id, category.id));
+  S.drawing[activeKey] = S.drawing[listKey][0]?.id || null;
+  S.drawing.categoryOpen = false;
+  S.drawing.updatedAt = now();
+  markDirty();
+  renderDrawing();
+}
+
+function bindDrawingDrop(target) {
+  target.addEventListener('dragover', e => {
+    if (Array.from(e.dataTransfer?.files || []).length) e.preventDefault();
+  });
+  target.addEventListener('drop', e => {
+    const files = Array.from(e.dataTransfer?.files || []).map(file => file.path).filter(Boolean);
+    if (!files.length) return;
+    e.preventDefault();
+    addDrawingFiles(files);
+  });
+}
+
+async function addDrawingMedia() {
+  const files = await pickMediaFiles('photo');
+  addDrawingFiles(files);
+}
+
+function addDrawingFiles(files) {
+  const valid = (files || []).filter(fp => kindAllowsFile('photo', fp));
+  if (!valid.length) return;
+  valid.forEach(fp => registerMediaFile(fp, S.drawing.id, 'photo', 'drawing'));
+  S.drawing.updatedAt = now();
+  markDirty();
+  renderDrawing();
+  toast(`Added: ${valid.length}`);
+}
+
+function removeDrawingMedia(mediaId) {
+  const media = getMediaById(mediaId);
+  if (!media) return;
+  if (!confirm(`Remove "${media.name}"?`)) return;
+  S.media = S.media.filter(item => item.id !== mediaId);
+  S.drawing.updatedAt = now();
+  markDirty();
+  renderDrawing();
+}
+
+function renderMoodboard() {
+  stopViewer();
+  hidePlayback();
+  S.moodboard = ensureMoodboardShape(S.moodboard);
+  if (!S.moodboard.boardOpen) {
+    renderMoodboardBoardLibrary();
+    return;
+  }
+  renderMoodboardCanvas();
+}
+
+function renderMoodboardBoardLibrary() {
+  S.moodboard = ensureMoodboardShape(S.moodboard);
+  $('main').innerHTML = `
+    <section class="screen moodboard-screen">
+      <div class="screen-head">
+        <div class="title-wrap">
+          <h1 class="screen-title">Moodboard</h1>
+        </div>
+        <div class="head-actions">
+          <button class="inline-btn" id="moodboard-new">+ Board</button>
+        </div>
+      </div>
+      <div class="screen-scroll" id="moodboard-board-body"></div>
+    </section>`;
+  $('moodboard-new').onclick = createMoodboardBoardFlow;
+  const body = $('moodboard-board-body');
+  body.innerHTML = '<div class="category-card-grid" id="moodboard-board-grid"></div>';
+  const grid = $('moodboard-board-grid');
+  S.moodboard.boards.forEach(board => {
+    const cover = (board.items || []).map(item => getMediaById(item.mediaId)).filter(Boolean)[0];
+    const card = document.createElement('button');
+    card.className = 'category-card media-category-card';
+    card.innerHTML = `
+      <div class="category-card-cover">${cover ? mediaPreviewHTML(cover, true) : 'B'}</div>
+      <div class="category-card-main">
+        <div class="category-card-title">${esc(board.title)}</div>
+        <div class="card-sub">${(board.items || []).length} images</div>
+      </div>`;
+    card.onclick = () => {
+      S.moodboard.activeBoardId = board.id;
+      S.activeMoodboardId = board.id;
+      S.moodboard.boardOpen = true;
+      V.moodboardHistory = [];
+      clearMoodboardSelection();
+      S.moodboard.updatedAt = now();
+      markDirty();
+      renderMoodboard();
+    };
+    grid.appendChild(card);
+  });
+}
+
+function saveMoodboardViewState(board) {
+  if (!board) return;
+  board.panX = V.mbPanX || 0;
+  board.panY = V.mbPanY || 0;
+}
+
+function applyMoodboardTransform(canvas, board) {
+  if (!canvas || !board) return;
+  const zoom = board.zoom || 1;
+  const px = V.mbPanX || 0;
+  const py = V.mbPanY || 0;
+  canvas.style.transform = `translate(${px}px, ${py}px) scale(${zoom})`;
+  const label = $('moodboard-zoom-label');
+  if (label) label.textContent = Math.round(zoom * 100) + '%';
+}
+
+function centerMoodboardView(board) {
+  if (!board) return;
+  const viewport = $('moodboard-viewport');
+  if (!viewport) return;
+  const vw = viewport.clientWidth;
+  const vh = viewport.clientHeight;
+  const zoom = board.zoom || 1;
+  if (!board.items || !board.items.length) {
+    V.mbPanX = vw / 2;
+    V.mbPanY = vh / 2;
+  } else {
+    const bounds = moodboardBoundsForItems(board.items);
+    if (!bounds) { V.mbPanX = vw / 2; V.mbPanY = vh / 2; }
+    else {
+      const cx = bounds.x + bounds.w / 2;
+      const cy = bounds.y + bounds.h / 2;
+      V.mbPanX = vw / 2 - cx * zoom;
+      V.mbPanY = vh / 2 - cy * zoom;
+    }
+  }
+  const canvas = $('moodboard-canvas');
+  if (canvas) applyMoodboardTransform(canvas, board);
+}
+
+function renderMoodboardCanvas() {
+  S.moodboard = ensureMoodboardShape(S.moodboard);
+  const board = getActiveMoodboard();
+  const zoom = board?.zoom || 1;
+
+  // Restore pan state
+  V.mbPanX = board?.panX ?? (V.mbPanX || 0);
+  V.mbPanY = board?.panY ?? (V.mbPanY || 0);
+
+  $('main').innerHTML = `
+    <section class="screen moodboard-screen">
+      <div class="screen-head roomy-head moodboard-toolbar">
+        <div class="title-wrap">
+          <span class="moodboard-board-name">${esc(board?.title || 'Board')}</span>
+          <span class="moodboard-zoom-label" id="moodboard-zoom-label">${Math.round(zoom * 100)}%</span>
+        </div>
+        <div class="head-actions">
+          <button class="ghost-btn" id="moodboard-add-media">+ Photos</button>
+          <button class="ghost-btn" id="moodboard-undo">Undo</button>
+          <button class="ghost-btn" id="moodboard-back-boards">Boards</button>
+          <button class="ghost-btn" id="moodboard-new">+ Board</button>
+          <button class="ghost-btn" id="moodboard-rename">Rename</button>
+          <button class="danger-btn" id="moodboard-delete-board">Delete</button>
+          <button class="danger-btn" id="moodboard-clear">Clear all</button>
+        </div>
+      </div>
+      <div class="moodboard-viewport" id="moodboard-viewport">
+        <div class="moodboard-canvas" id="moodboard-canvas"></div>
+        ${!board?.items.length ? `
+        <div class="moodboard-empty-overlay" id="moodboard-empty-overlay">
+          <div class="moodboard-empty-box">
+            <div class="moodboard-empty-icon">+</div>
+            <div class="moodboard-empty-title">Drop images here</div>
+            <div class="moodboard-empty-sub">or click to add photos to your board</div>
+            <button class="inline-btn moodboard-empty-btn" id="moodboard-empty-add">+ Add Photos</button>
+          </div>
+        </div>` : ''}
+      </div>
+    </section>`;
+
+  $('moodboard-back-boards').onclick = () => {
+    saveMoodboardViewState(board);
+    S.moodboard.boardOpen = false;
+    clearMoodboardSelection();
+    V.mbPanX = 0; V.mbPanY = 0;
+    S.moodboard.updatedAt = now();
+    markDirty();
+    renderMoodboard();
+  };
+  $('moodboard-undo').onclick = undoMoodboard;
+  $('moodboard-clear').onclick = clearMoodboard;
+  $('moodboard-new').onclick = createMoodboardBoardFlow;
+  $('moodboard-rename').onclick = () => renameMoodboardBoard(board);
+  $('moodboard-delete-board').onclick = () => deleteMoodboardBoard(board);
+  $('moodboard-add-media').onclick = addMoodboardMedia;
+  if ($('moodboard-empty-add')) $('moodboard-empty-add').onclick = addMoodboardMedia;
+
+  const viewport = $('moodboard-viewport');
+  const canvas = $('moodboard-canvas');
+
+  applyMoodboardTransform(canvas, board);
+  renderMoodboardItems(board);
+  bindMoodboardViewport(viewport, canvas, board);
+  bindMoodboardMarquee(viewport, canvas, board);
+  bindMoodboardDrop(viewport, canvas, board);
+
+  if (!V.moodboardViewportReady) V.moodboardViewportReady = {};
+  if (!V.moodboardViewportReady[board?.id]) {
+    V.moodboardViewportReady[board?.id] = true;
+    requestAnimationFrame(() => centerMoodboardView(board));
+  }
+}
+
+function renderMoodboardTabs() {
+  const tabs = $('moodboard-tabs');
+  if (!tabs) return;
+  tabs.innerHTML = '';
+  S.moodboard.boards.forEach(board => {
+    const btn = document.createElement('button');
+    btn.className = 'chip-btn' + (sameId(board.id, S.moodboard.activeBoardId) ? ' active' : '');
+    btn.textContent = board.title;
+    btn.onclick = () => {
+      S.moodboard.activeBoardId = board.id;
+      S.activeMoodboardId = board.id;
+      V.moodboardHistory = [];
+      clearMoodboardSelection();
+      S.moodboard.updatedAt = now();
+      markDirty();
+      renderMoodboard();
+    };
+    tabs.appendChild(btn);
+  });
+}
+
+function createMoodboardBoardFlow() {
+  askText('New Moodboard', '', 'Create', title => {
+    const board = ensureMoodboardBoardShape({
+      id: 'mb_' + uid(),
+      title,
+      items: [],
+      zoom: 1,
+      createdAt: now(),
+      updatedAt: now(),
+    }, S.moodboard.boards.length);
+    S.moodboard.boards.push(board);
+    S.moodboard.activeBoardId = board.id;
+    S.activeMoodboardId = board.id;
+    S.moodboard.boardOpen = true;
+    V.moodboardHistory = [];
+    clearMoodboardSelection();
+    S.moodboard.updatedAt = now();
+    markDirty();
+    renderMoodboard();
+  });
+}
+
+function renameMoodboardBoard(board) {
+  if (!board) return;
+  askText('Rename Moodboard', board.title || '', 'Save', title => {
+    board.title = title;
+    board.updatedAt = now();
+    S.moodboard.updatedAt = now();
+    markDirty();
+    renderMoodboard();
+  });
+}
+
+function deleteMoodboardBoard(board) {
+  if (!board) return;
+  if (S.moodboard.boards.length <= 1) {
+    toast('Keep one board');
+    return;
+  }
+  if (!confirm(`Delete moodboard "${board.title}"?`)) return;
+  const mediaIds = new Set((board.items || []).map(item => item.mediaId).filter(Boolean));
+  S.media = S.media.filter(media => !mediaIds.has(media.id));
+  S.moodboard.boards = S.moodboard.boards.filter(item => !sameId(item.id, board.id));
+  S.moodboard.activeBoardId = S.moodboard.boards[0]?.id || null;
+  S.activeMoodboardId = S.moodboard.activeBoardId;
+  S.moodboard.boardOpen = false;
+  V.moodboardHistory = [];
+  clearMoodboardSelection();
+  S.moodboard.updatedAt = now();
+  markDirty();
+  renderMoodboard();
+}
+
+function moodboardDimensions(board = getActiveMoodboard()) {
+  const items = board?.items || [];
+  const minX = Math.min(0, ...items.map(item => Number(item.x || 0)));
+  const minY = Math.min(0, ...items.map(item => Number(item.y || 0)));
+  const maxX = Math.max(0, ...items.map(item => Number(item.x || 0) + Number(item.w || 0)));
+  const maxY = Math.max(0, ...items.map(item => Number(item.y || 0) + Number(item.h || 0)));
+  if (board) {
+    board.originX = Math.max(Number(board.originX || MOODBOARD_WORLD_MARGIN), Math.ceil(MOODBOARD_WORLD_MARGIN - minX));
+    board.originY = Math.max(Number(board.originY || MOODBOARD_WORLD_MARGIN), Math.ceil(MOODBOARD_WORLD_MARGIN - minY));
+  }
+  const originX = Number(board?.originX || MOODBOARD_WORLD_MARGIN);
+  const originY = Number(board?.originY || MOODBOARD_WORLD_MARGIN);
+  const width = Math.max(MOODBOARD_WORLD_MIN_WIDTH, Math.ceil(originX + maxX + MOODBOARD_WORLD_MARGIN));
+  const height = Math.max(MOODBOARD_WORLD_MIN_HEIGHT, Math.ceil(originY + maxY + MOODBOARD_WORLD_MARGIN));
+  return { width, height, originX, originY };
+}
+
+function updateMoodboardSpaceSize(board = getActiveMoodboard()) {
+  const canvas = $('moodboard-canvas');
+  if (!canvas) return;
+  applyMoodboardTransform(canvas, board);
+  syncMoodboardRenderedPositions(board);
+}
+
+function syncMoodboardRenderedPositions(board = getActiveMoodboard()) {
+  const canvas = $('moodboard-canvas');
+  if (!canvas || !board) return;
+  canvas.querySelectorAll('.moodboard-item').forEach(el => {
+    const item = (board.items || []).find(next => sameId(next.id, el.dataset.itemId));
+    if (item) setMoodboardItemStyle(el, item);
+  });
+  syncMoodboardSelectionBox(board);
+}
+
+function centerMoodboardViewportIfNeeded(scroll, board, dims = moodboardDimensions(board), zoom = board?.zoom || 1) {
+  if (!scroll || !board) return;
+  if (!V.moodboardViewportReady || typeof V.moodboardViewportReady !== 'object') V.moodboardViewportReady = {};
+  if (V.moodboardViewportReady[board.id]) return;
+  V.moodboardViewportReady[board.id] = true;
+  requestAnimationFrame(() => {
+    const bounds = moodboardBoundsForItems(board.items || []) || { x: 0, y: 0, w: 1, h: 1 };
+    const targetX = dims.originX + bounds.x + bounds.w / 2;
+    const targetY = dims.originY + bounds.y + bounds.h / 2;
+    scroll.scrollLeft = Math.max(0, targetX * zoom - scroll.clientWidth / 2);
+    scroll.scrollTop = Math.max(0, targetY * zoom - scroll.clientHeight / 2);
+  });
+}
+
+function renderMoodboardItems(board = getActiveMoodboard()) {
+  const space = $('moodboard-canvas');
+  if (!space) return;
+  const selectedIds = new Set(moodboardSelectionIds(board));
+  (board?.items || [])
+    .map(ensureMoodboardItemShape)
+    .sort((a, b) => (a.z ?? 0) - (b.z ?? 0))
+    .forEach(item => {
+      const media = getMediaById(item.mediaId);
+      const el = document.createElement('div');
+      el.className = 'moodboard-item' + (selectedIds.has(item.id) ? ' selected' : '');
+      el.dataset.itemId = item.id;
+      setMoodboardItemStyle(el, item);
+      el.innerHTML = `
+        <div class="moodboard-image">${media ? mediaPreviewHTML(media, true) : '<span>Missing</span>'}</div>
+        <button class="moodboard-delete" title="Delete">x</button>
+        <span class="moodboard-resize" title="Resize"></span>`;
+      el.ondblclick = e => {
+        if (e.target.closest('button, .moodboard-resize')) return;
+        if (media) openAlbumPhoto(media.id);
+      };
+      el.querySelector('.moodboard-delete').onclick = e => {
+        e.stopPropagation();
+        removeMoodboardItem(board, item.id);
+      };
+      el.addEventListener('pointerdown', e => {
+        if (e.button !== 0) return;
+        if (e.target.closest('button, .moodboard-resize')) return;
+        if (e.ctrlKey || e.metaKey || e.shiftKey) {
+          e.preventDefault();
+          e.stopPropagation();
+          toggleMoodboardSelection(item.id, board);
+          renderMoodboard();
+          return;
+        }
+        // If clicking a different item without modifier, select only it
+        const sel = moodboardSelectionIds(board);
+        if (!sel.includes(item.id) || sel.length > 1) {
+          setMoodboardSelection([item.id], board);
+          syncMoodboardSelectionClasses(board);
+          renderMoodboardSelectionBox(board);
+        }
+        startMoodboardInteraction(e, board, item, el, 'move');
+      });
+      el.querySelector('.moodboard-resize').addEventListener('pointerdown', e => {
+        if (!moodboardSelectionIds(board).includes(item.id)) setMoodboardSelection([item.id], board);
+        startMoodboardInteraction(e, board, item, el, 'resize');
+      });
+      space.appendChild(el);
+    });
+  renderMoodboardSelectionBox(board);
+}
+
+function setMoodboardItemStyle(el, item) {
+  el.style.left = `${Math.round(Number(item.x || 0))}px`;
+  el.style.top = `${Math.round(Number(item.y || 0))}px`;
+  el.style.width = `${Math.round(item.w)}px`;
+  el.style.height = `${Math.round(item.h)}px`;
+  el.style.zIndex = String(item.z || 1);
+}
+
+function moodboardSelectionIds(board = getActiveMoodboard()) {
+  const valid = new Set((board?.items || []).map(item => item.id));
+  V.moodboardSelection = (Array.isArray(V.moodboardSelection) ? V.moodboardSelection : [])
+    .filter(id => valid.has(id));
+  return V.moodboardSelection;
+}
+
+function setMoodboardSelection(ids = [], board = getActiveMoodboard()) {
+  const valid = new Set((board?.items || []).map(item => item.id));
+  V.moodboardSelection = [...new Set(ids)].filter(id => valid.has(id));
+}
+
+function toggleMoodboardSelection(itemId, board = getActiveMoodboard()) {
+  const selected = new Set(moodboardSelectionIds(board));
+  if (selected.has(itemId)) selected.delete(itemId);
+  else selected.add(itemId);
+  setMoodboardSelection([...selected], board);
+}
+
+function clearMoodboardSelection() {
+  V.moodboardSelection = [];
+}
+
+function selectedMoodboardItems(board = getActiveMoodboard()) {
+  const ids = new Set(moodboardSelectionIds(board));
+  return (board?.items || []).filter(item => ids.has(item.id));
+}
+
+function getMoodboardItemElement(itemId) {
+  const space = $('moodboard-canvas');
+  if (!space) return null;
+  return Array.from(space.querySelectorAll('.moodboard-item'))
+    .find(el => el.dataset.itemId === String(itemId)) || null;
+}
+
+function syncMoodboardSelectionClasses(board = getActiveMoodboard()) {
+  const space = $('moodboard-canvas');
+  if (!space) return;
+  const ids = new Set(moodboardSelectionIds(board));
+  space.querySelectorAll('.moodboard-item').forEach(el => {
+    el.classList.toggle('selected', ids.has(el.dataset.itemId));
+  });
+}
+
+function moodboardClientPoint(e, canvas = $('moodboard-canvas'), board = getActiveMoodboard()) {
+  // Convert screen coords to world coords
+  const zoom = board?.zoom || 1;
+  const px = V.mbPanX || 0;
+  const py = V.mbPanY || 0;
+  const viewport = $('moodboard-viewport');
+  if (!viewport) return { x: 0, y: 0 };
+  const rect = viewport.getBoundingClientRect();
+  return {
+    x: (e.clientX - rect.left - px) / zoom,
+    y: (e.clientY - rect.top - py) / zoom,
+  };
+}
+
+function moodboardItemRect(item) {
+  return {
+    x: Number(item.x || 0),
+    y: Number(item.y || 0),
+    w: Number(item.w || 0),
+    h: Number(item.h || 0),
+  };
+}
+
+function normalizeMoodboardRect(a, b) {
+  const x = Math.min(a.x, b.x);
+  const y = Math.min(a.y, b.y);
+  return {
+    x,
+    y,
+    w: Math.abs(a.x - b.x),
+    h: Math.abs(a.y - b.y),
+  };
+}
+
+function rectsIntersect(a, b) {
+  return a.x < b.x + b.w
+    && a.x + a.w > b.x
+    && a.y < b.y + b.h
+    && a.y + a.h > b.y;
+}
+
+function moodboardBoundsForItems(items) {
+  if (!items.length) return null;
+  const rects = items.map(moodboardItemRect);
+  const left = Math.min(...rects.map(rect => rect.x));
+  const top = Math.min(...rects.map(rect => rect.y));
+  const right = Math.max(...rects.map(rect => rect.x + rect.w));
+  const bottom = Math.max(...rects.map(rect => rect.y + rect.h));
+  return { x: left, y: top, w: right - left, h: bottom - top };
+}
+
+function moodboardSelectionBounds(board = getActiveMoodboard()) {
+  return moodboardBoundsForItems(selectedMoodboardItems(board));
+}
+
+function setMoodboardRectStyle(el, rect) {
+  el.style.left = `${Math.round(rect.x)}px`;
+  el.style.top = `${Math.round(rect.y)}px`;
+  el.style.width = `${Math.max(1, Math.round(rect.w))}px`;
+  el.style.height = `${Math.max(1, Math.round(rect.h))}px`;
+}
+
+function syncMoodboardSelectionBox(board = getActiveMoodboard()) {
+  const box = $('moodboard-selection-box');
+  const bounds = moodboardSelectionBounds(board);
+  if (!box || !bounds) return;
+  setMoodboardRectStyle(box, bounds);
+}
+
+function renderMoodboardSelectionBox(board = getActiveMoodboard()) {
+  const space = $('moodboard-canvas');
+  const items = selectedMoodboardItems(board);
+  if (!space || items.length < 2) return;
+  const bounds = moodboardBoundsForItems(items);
+  if (!bounds) return;
+  const box = document.createElement('div');
+  box.id = 'moodboard-selection-box';
+  box.className = 'moodboard-selection-box';
+  setMoodboardRectStyle(box, bounds);
+  box.innerHTML = ['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w']
+    .map(handle => `<span class="moodboard-selection-handle ${handle}" data-handle="${handle}"></span>`)
+    .join('') +
+    `<button class="moodboard-group-delete" title="Delete selected">×</button>`;
+  box.addEventListener('pointerdown', e => {
+    if (e.target.closest('.moodboard-selection-handle, .moodboard-group-delete')) return;
+    startMoodboardGroupMove(e, board);
+  });
+  box.querySelectorAll('.moodboard-selection-handle').forEach(handle => {
+    handle.addEventListener('pointerdown', e => {
+      startMoodboardGroupResize(e, board, handle.dataset.handle);
+    });
+  });
+  box.querySelector('.moodboard-group-delete').addEventListener('click', e => {
+    e.stopPropagation();
+    pushMoodboardUndo();
+    const ids = new Set(moodboardSelectionIds(board));
+    board.items = (board.items || []).filter(item => !ids.has(item.id));
+    clearMoodboardSelection();
+    board.updatedAt = now();
+    S.moodboard.updatedAt = now();
+    markDirty();
+    renderMoodboard();
+  });
+  space.appendChild(box);
+}
+
+function touchMoodboardAfterInteraction(board, items = []) {
+  const stamp = now();
+  items.forEach(item => { item.updatedAt = stamp; });
+  if (board) board.updatedAt = stamp;
+  if (S.moodboard) S.moodboard.updatedAt = stamp;
+}
+
+function startMoodboardGroupMove(e, board) {
+  if (e.button !== 0) return;
+  const targets = selectedMoodboardItems(board);
+  if (!targets.length) return;
+  e.preventDefault();
+  e.stopPropagation();
+  pushMoodboardUndo();
+  bringMoodboardItemsForward(board, targets);
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const zoom = board?.zoom || 1;
+  const entries = targets.map(item => ({
+    item,
+    x: item.x,
+    y: item.y,
+    el: getMoodboardItemElement(item.id),
+  }));
+  entries.forEach(({ item, el }) => { if (el) setMoodboardItemStyle(el, item); });
+  syncMoodboardSelectionBox(board);
+  const onMove = moveEvent => {
+    const dx = (moveEvent.clientX - startX) / zoom;
+    const dy = (moveEvent.clientY - startY) / zoom;
+    entries.forEach(({ item, x, y, el }) => {
+      item.x = x + dx;
+      item.y = y + dy;
+      if (el) setMoodboardItemStyle(el, item);
+    });
+    touchMoodboardAfterInteraction(board, targets);
+    updateMoodboardSpaceSize(board);
+    syncMoodboardSelectionBox(board);
+  };
+  const onUp = () => {
+    document.removeEventListener('pointermove', onMove, true);
+    document.removeEventListener('pointerup', onUp, true);
+    markDirty();
+  };
+  document.addEventListener('pointermove', onMove, true);
+  document.addEventListener('pointerup', onUp, true);
+}
+
+function startMoodboardGroupResize(e, board, handle = 'se') {
+  if (e.button !== 0) return;
+  const targets = selectedMoodboardItems(board);
+  const startBounds = moodboardBoundsForItems(targets);
+  if (targets.length < 2 || !startBounds || !startBounds.w || !startBounds.h) return;
+  e.preventDefault();
+  e.stopPropagation();
+  pushMoodboardUndo();
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const zoom = board?.zoom || 1;
+  const entries = targets.map(item => ({
+    item,
+    rect: moodboardItemRect(item),
+    el: getMoodboardItemElement(item.id),
+  }));
+  const minBox = 120;
+  const onMove = moveEvent => {
+    const dx = (moveEvent.clientX - startX) / zoom;
+    const dy = (moveEvent.clientY - startY) / zoom;
+    let left = startBounds.x;
+    let top = startBounds.y;
+    let right = startBounds.x + startBounds.w;
+    let bottom = startBounds.y + startBounds.h;
+    if (handle.includes('w')) left = startBounds.x + dx;
+    if (handle.includes('e')) right = startBounds.x + startBounds.w + dx;
+    if (handle.includes('n')) top = startBounds.y + dy;
+    if (handle.includes('s')) bottom = startBounds.y + startBounds.h + dy;
+    if (right - left < minBox) {
+      if (handle.includes('w')) left = right - minBox;
+      else right = left + minBox;
+    }
+    if (bottom - top < minBox) {
+      if (handle.includes('n')) top = bottom - minBox;
+      else bottom = top + minBox;
+    }
+    const nextBounds = { x: left, y: top, w: right - left, h: bottom - top };
+    const scaleX = nextBounds.w / startBounds.w;
+    const scaleY = nextBounds.h / startBounds.h;
+    entries.forEach(({ item, rect, el }) => {
+      item.x = nextBounds.x + (rect.x - startBounds.x) * scaleX;
+      item.y = nextBounds.y + (rect.y - startBounds.y) * scaleY;
+      item.w = Math.max(80, rect.w * scaleX);
+      item.h = Math.max(80, rect.h * scaleY);
+      if (el) setMoodboardItemStyle(el, item);
+    });
+    touchMoodboardAfterInteraction(board, targets);
+    updateMoodboardSpaceSize(board);
+    syncMoodboardSelectionBox(board);
+  };
+  const onUp = () => {
+    document.removeEventListener('pointermove', onMove, true);
+    document.removeEventListener('pointerup', onUp, true);
+    markDirty();
+  };
+  document.addEventListener('pointermove', onMove, true);
+  document.addEventListener('pointerup', onUp, true);
+}
+
+function startMoodboardInteraction(e, board, item, el, mode) {
+  if (e.button !== 0) return;
+  const selection = moodboardSelectionIds(board);
+  if (selection.includes(item.id) && selection.length > 1) {
+    if (mode === 'resize') startMoodboardGroupResize(e, board, 'se');
+    else startMoodboardGroupMove(e, board);
+    return;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  pushMoodboardUndo();
+  bringMoodboardItemForward(board, item);
+  setMoodboardItemStyle(el, item);
+  el.classList.add(mode === 'resize' ? 'resizing' : 'moving');
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const initial = { x: item.x, y: item.y, w: item.w, h: item.h };
+  const zoom = board?.zoom || 1;
+  const onMove = moveEvent => {
+    const dx = (moveEvent.clientX - startX) / zoom;
+    const dy = (moveEvent.clientY - startY) / zoom;
+    if (mode === 'resize') {
+      item.w = Math.max(80, initial.w + dx);
+      item.h = Math.max(80, initial.h + dy);
+    } else {
+      item.x = initial.x + dx;
+      item.y = initial.y + dy;
+    }
+    item.updatedAt = now();
+    board.updatedAt = now();
+    S.moodboard.updatedAt = now();
+    setMoodboardItemStyle(el, item);
+    updateMoodboardSpaceSize(board);
+  };
+  const onUp = () => {
+    el.classList.remove('moving', 'resizing');
+    document.removeEventListener('pointermove', onMove, true);
+    document.removeEventListener('pointerup', onUp, true);
+    markDirty();
+  };
+  document.addEventListener('pointermove', onMove, true);
+  document.addEventListener('pointerup', onUp, true);
+}
+
+function bringMoodboardItemForward(board, item) {
+  const maxZ = Math.max(1, ...(board?.items || []).map(next => Number(next.z || 1)));
+  item.z = maxZ + 1;
+}
+
+function bringMoodboardItemsForward(board, items) {
+  const targets = [...items].sort((a, b) => Number(a.z || 1) - Number(b.z || 1));
+  let maxZ = Math.max(1, ...(board?.items || []).map(next => Number(next.z || 1)));
+  targets.forEach(item => {
+    maxZ += 1;
+    item.z = maxZ;
+  });
+}
+
+function moodboardSnapshot() {
+  const board = getActiveMoodboard();
+  return JSON.stringify({
+    boardId: board?.id || null,
+    zoom: board?.zoom || 1,
+    originX: board?.originX || MOODBOARD_WORLD_MARGIN,
+    originY: board?.originY || MOODBOARD_WORLD_MARGIN,
+    items: (board?.items || []).map(item => ({ ...item })),
+  });
+}
+
+function pushMoodboardUndo() {
+  V.moodboardHistory.push(moodboardSnapshot());
+  if (V.moodboardHistory.length > 50) V.moodboardHistory.shift();
+}
+
+function undoMoodboard() {
+  const snap = V.moodboardHistory.pop();
+  if (!snap) {
+    toast('Nothing to undo');
+    return;
+  }
+  try {
+    const data = JSON.parse(snap);
+    const board = S.moodboard.boards.find(item => sameId(item.id, data.boardId)) || getActiveMoodboard();
+    if (!board) return;
+    board.items = Array.isArray(data.items) ? data.items.map(ensureMoodboardItemShape) : [];
+    board.zoom = clampNumber(data.zoom, board.zoom || 1, .1, 8);
+    board.originX = clampNumber(data.originX, board.originX || MOODBOARD_WORLD_MARGIN, 1000, 10000000);
+    board.originY = clampNumber(data.originY, board.originY || MOODBOARD_WORLD_MARGIN, 1000, 10000000);
+    board.updatedAt = now();
+    S.moodboard.activeBoardId = board.id;
+    S.activeMoodboardId = board.id;
+    S.moodboard.updatedAt = now();
+    clearMoodboardSelection();
+    markDirty();
+    renderMoodboard();
+  } catch (e) {
+    toast('Could not undo');
+  }
+}
+
+function clearMoodboard() {
+  const board = getActiveMoodboard();
+  if (!board?.items.length) return;
+  if (!confirm('Clear all moodboard images?')) return;
+  pushMoodboardUndo();
+  board.items = [];
+  clearMoodboardSelection();
+  board.updatedAt = now();
+  S.moodboard.updatedAt = now();
+  markDirty();
+  renderMoodboard();
+}
+
+function removeMoodboardItem(board, itemId) {
+  if (!board) return;
+  pushMoodboardUndo();
+  board.items = board.items.filter(item => item.id !== itemId);
+  setMoodboardSelection(moodboardSelectionIds(board).filter(id => id !== itemId), board);
+  board.updatedAt = now();
+  S.moodboard.updatedAt = now();
+  markDirty();
+  renderMoodboard();
+}
+
+function bindMoodboardMarquee(viewport, canvas, board) {
+  if (!viewport || !canvas || !board) return;
+
+  let marqueeActive = false;
+
+  viewport.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    if (V._mbPanMode) return;
+    // Only start marquee on empty viewport/canvas (not on items or selection box)
+    const onItem = e.target.closest('.moodboard-item, .moodboard-selection-box, .moodboard-group-delete, button');
+    if (onItem) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    marqueeActive = true;
+
+    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    const baseIds = additive ? [...moodboardSelectionIds(board)] : [];
+    const startW = moodboardClientPoint(e);
+    let cur = { ...startW };
+    let moved = false;
+
+    // Create marquee element on the canvas (so it transforms with zoom/pan)
+    const marqueeEl = document.createElement('div');
+    marqueeEl.className = 'moodboard-marquee';
+    setMoodboardRectStyle(marqueeEl, { x: startW.x, y: startW.y, w: 0, h: 0 });
+    canvas.appendChild(marqueeEl);
+
+    const onMove = mv => {
+      cur = moodboardClientPoint(mv);
+      const rect = normalizeMoodboardRect(startW, cur);
+      moved = moved || rect.w > 3 || rect.h > 3;
+      setMoodboardRectStyle(marqueeEl, rect);
+    };
+    const onUp = uv => {
+      cur = moodboardClientPoint(uv);
+      marqueeEl.remove();
+      marqueeActive = false;
+      document.removeEventListener('pointermove', onMove, true);
+      document.removeEventListener('pointerup', onUp, true);
+
+      if (moved) {
+        const rect = normalizeMoodboardRect(startW, cur);
+        const hits = (board.items || [])
+          .filter(item => rectsIntersect(rect, moodboardItemRect(item)))
+          .map(item => item.id);
+        const next = new Set(baseIds);
+        hits.forEach(id => next.add(id));
+        setMoodboardSelection([...next], board);
+      } else if (!additive) {
+        clearMoodboardSelection();
+      }
+      renderMoodboard();
+    };
+    document.addEventListener('pointermove', onMove, true);
+    document.addEventListener('pointerup', onUp, true);
+  });
+}
+
+function bindMoodboardViewport(viewport, canvas, board) {
+  if (!viewport || !canvas || !board) return;
+
+  viewport.addEventListener('contextmenu', e => e.preventDefault());
+
+  // Zoom: scroll wheel toward cursor
+  viewport.addEventListener('wheel', e => {
+    e.preventDefault();
+    const zoom = board.zoom || 1;
+    if (e.shiftKey && !e.ctrlKey) {
+      V.mbPanX = (V.mbPanX || 0) - e.deltaY * 0.8;
+    } else {
+      const factor = Math.pow(1.0015, -e.deltaY);
+      const nextZoom = clampNumber(zoom * factor, zoom, 0.05, 20);
+      if (Math.abs(nextZoom - zoom) < 0.0001) return;
+      const rect = viewport.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      const px = V.mbPanX || 0;
+      const py = V.mbPanY || 0;
+      V.mbPanX = mx - (mx - px) * (nextZoom / zoom);
+      V.mbPanY = my - (my - py) * (nextZoom / zoom);
+      board.zoom = nextZoom;
+    }
+    board.panX = V.mbPanX;
+    board.panY = V.mbPanY;
+    board.updatedAt = now();
+    S.moodboard.updatedAt = now();
+    applyMoodboardTransform(canvas, board);
+    markDirty();
+  }, { passive: false });
+
+  V._mbPanMode = false;
+  let panning = false;
+  let panStartX = 0, panStartY = 0, panStartPX = 0, panStartPY = 0;
+
+  const onKeyDown = e => {
+    if (e.code === 'Space' && !['INPUT','TEXTAREA'].includes(document.activeElement?.tagName)) {
+      e.preventDefault();
+      V._mbPanMode = true;
+      viewport.classList.add('pan-mode');
+    }
+  };
+  const onKeyUp = e => {
+    if (e.code === 'Space') {
+      V._mbPanMode = false;
+      if (!panning) viewport.classList.remove('pan-mode');
+    }
+  };
+  document.addEventListener('keydown', onKeyDown);
+  document.addEventListener('keyup', onKeyUp);
+  viewport._mbCleanup = () => {
+    document.removeEventListener('keydown', onKeyDown);
+    document.removeEventListener('keyup', onKeyUp);
+  };
+
+  const startPan = e => {
+    panning = true;
+    panStartX = e.clientX; panStartY = e.clientY;
+    panStartPX = V.mbPanX || 0; panStartPY = V.mbPanY || 0;
+    viewport.classList.add('panning');
+    try { viewport.setPointerCapture(e.pointerId); } catch(_) {}
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  viewport.addEventListener('pointerdown', e => {
+    // Right mouse = pan (Miro style)
+    if (e.button === 2) { startPan(e); return; }
+    // Middle mouse = pan
+    if (e.button === 1) { startPan(e); return; }
+    // Space + left = pan
+    if (e.button === 0 && V._mbPanMode) { startPan(e); return; }
+    // Left without space: marquee handled by bindMoodboardMarquee
+  });
+
+  viewport.addEventListener('pointermove', e => {
+    if (!panning) return;
+    V.mbPanX = panStartPX + (e.clientX - panStartX);
+    V.mbPanY = panStartPY + (e.clientY - panStartY);
+    board.panX = V.mbPanX;
+    board.panY = V.mbPanY;
+    applyMoodboardTransform(canvas, board);
+  });
+
+  const stopPan = e => {
+    if (!panning) return;
+    panning = false;
+    viewport.classList.remove('panning');
+    if (!V._mbPanMode) viewport.classList.remove('pan-mode');
+    try { viewport.releasePointerCapture(e.pointerId); } catch(_) {}
+    markDirty();
+  };
+  viewport.addEventListener('pointerup', stopPan);
+  viewport.addEventListener('pointercancel', stopPan);
+}
+
+function bindMoodboardDrop(viewport, canvas, board) {
+  viewport.addEventListener('dragover', e => {
+    if (dropHasFiles(e.dataTransfer)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      viewport.classList.add('drag-over');
+    }
+  });
+  viewport.addEventListener('dragleave', e => {
+    if (!viewport.contains(e.relatedTarget)) viewport.classList.remove('drag-over');
+  });
+  viewport.addEventListener('drop', e => {
+    if (!dropHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    const files = filePathsFromDrop(e.dataTransfer);
+    if (!files.length) {
+      viewport.classList.remove('drag-over');
+      toast('Could not read dropped files');
+      return;
+    }
+    viewport.classList.remove('drag-over');
+    addMoodboardFiles(files, moodboardClientPoint(e, canvas, board));
+  });
+}
+
+async function addMoodboardMedia() {
+  const files = await pickMediaFiles('photo');
+  const viewport = $('moodboard-viewport');
+  const board = getActiveMoodboard();
+  const zoom = board?.zoom || 1;
+  const vw = viewport?.clientWidth || 800;
+  const vh = viewport?.clientHeight || 600;
+  const px = V.mbPanX || 0;
+  const py = V.mbPanY || 0;
+  addMoodboardFiles(files, {
+    x: (vw / 2 - px) / zoom - 140,
+    y: (vh / 2 - py) / zoom - 100,
+  });
+}
+
+function addMoodboardFiles(files, point = { x: 120, y: 120 }) {
+  const board = getActiveMoodboard();
+  if (!board) return;
+  const valid = (files || []).filter(fp => kindAllowsFile('photo', fp));
+  if (!valid.length) {
+    toast('Use image files');
+    return;
+  }
+  pushMoodboardUndo();
+  const addedIds = [];
+  valid.forEach((fp, index) => {
+    const media = registerMediaFile(fp, board.id, 'photo', 'moodboard');
+    if (!media) return;
+    const item = ensureMoodboardItemShape({
+      id: 'mbi_' + uid(),
+      mediaId: media.id,
+      x: Math.round(point.x + index * 28),
+      y: Math.round(point.y + index * 28),
+      w: 280,
+      h: 210,
+      z: board.items.length + index + 1,
+      createdAt: now(),
+      updatedAt: now(),
+    });
+    board.items.push(item);
+    addedIds.push(item.id);
+  });
+  setMoodboardSelection(addedIds, board);
+  board.updatedAt = now();
+  S.moodboard.updatedAt = now();
+  markDirty();
+  renderMoodboard();
+  toast(`Added: ${valid.length}`);
 }
 
 function openAlbumPhoto(mediaId) {
@@ -3233,6 +6053,7 @@ function renderKanbanBoard(project, milestone, board) {
       const payload = JSON.parse(e.dataTransfer.getData('application/x-refboard-task') || '{}');
       if (!payload.taskId || payload.boardId !== board.id) return;
       moveTask(project, milestone, board, payload.columnKey, payload.taskId, key);
+      if (key === 'done') syncExtraQuestDone(payload.taskId);
     });
     tasks.forEach(task => taskList.appendChild(buildTaskCard(project, milestone, board, key, task)));
     columns.appendChild(col);
@@ -3263,14 +6084,20 @@ function buildTaskCard(project, milestone, board, columnKey, task) {
     (task.notes || '').trim().slice(0, 96),
     (task.mediaIds || []).length ? `${(task.mediaIds || []).length} media` : '',
   ].filter(Boolean).join(' - ');
+  const alreadyInDaily = isKanbanTaskLinkedToExtras(task.id);
   card.innerHTML = `
     <div class="task-card-top">
       ${importanceBadgeHTML(task.importance)}
       <span class="task-title-btn">${esc(task.title || 'Untitled')}</span>
+      <button class="task-to-today-btn${alreadyInDaily ? ' added' : ''}" data-task-id="${esc(task.id)}" title="Add to Today's extras" ${alreadyInDaily ? 'disabled' : ''}>${alreadyInDaily ? '✓' : '+Today'}</button>
     </div>
     ${meta ? `<div class="task-card-meta">${esc(meta)}</div>` : ''}`;
+  card.querySelector('.task-to-today-btn').addEventListener('click', e => {
+    e.stopPropagation();
+    addKanbanTaskToTodayExtras(task);
+  });
   card.addEventListener('click', e => {
-    if (dragging || e.target.closest('.rarity-badge')) return;
+    if (dragging || e.target.closest('.rarity-badge, .task-to-today-btn')) return;
     openTaskNotebook(project.id, milestone.id, board.id, columnKey, task.id);
   });
   bindImportanceTriggers(card, () => task.importance, value => {
@@ -3293,6 +6120,7 @@ function addTaskFlow(project, milestone, board, columnKey) {
       notes: '',
       importance: columnKey === 'ideas' ? 'noted' : 'common',
       mediaIds: [],
+      completedAt: columnKey === 'done' ? now() : null,
       createdAt: now(),
       updatedAt: now(),
     }));
@@ -3305,15 +6133,34 @@ function addTaskFlow(project, milestone, board, columnKey) {
 }
 
 function moveTask(project, milestone, board, fromColumn, taskId, toColumn) {
+  if (fromColumn === toColumn) return;
   const list = board.columns[fromColumn] || [];
   const task = list.find(item => item.id === taskId);
   if (!task || !board.columns[toColumn]) return;
+  const previousCompletedDate = taskCompletedISO(task);
+  let dailyDay = null;
+  let beforeDailyStats = null;
+  if (toColumn === 'done' && S.dailies?.enabled !== false) {
+    ensureDailiesReady({ dirty: false });
+    dailyDay = getOrCreateDailyDay(todayISO());
+    beforeDailyStats = dailyStats(dailyDay);
+  }
   board.columns[fromColumn] = list.filter(item => item.id !== taskId);
   board.columns[toColumn].push(task);
+  if (toColumn === 'done') task.completedAt = now();
+  else if (fromColumn === 'done') task.completedAt = null;
   task.updatedAt = now();
   board.updatedAt = now();
   milestone.updatedAt = now();
   touchProject(project);
+  if (dailyDay) {
+    touchDailyDay(dailyDay);
+    updateDailyCompletion(dailyDay, beforeDailyStats, { title: task.title || 'Task', source: 'project' }, 'done');
+  }
+  const nextCompletedDate = taskCompletedISO(task);
+  if (previousCompletedDate && previousCompletedDate !== nextCompletedDate) {
+    refreshDailyStatusForDate(previousCompletedDate);
+  }
   markDirty();
 
   const stats = milestoneStats(milestone);
@@ -4131,7 +6978,7 @@ async function addMediaToActiveGame(kind) {
 function addDroppedFiles(fileList, kind) {
   const game = getActiveGame();
   if (!game) return;
-  const files = Array.from(fileList || []).map(f => f.path).filter(Boolean);
+  const files = filePathsFromDrop(fileList);
   const valid = files.filter(fp => kindAllowsFile(kind, fp));
   if (!valid.length) {
     toast(kind === 'video' ? 'Use video or GIF' : kind === 'sound' ? 'Use audio' : 'Use image or GIF');
@@ -4143,6 +6990,24 @@ function addDroppedFiles(fileList, kind) {
   if (kind === 'photo' || kind === 'video') renderGameMediaGridTab(game, kind);
   else renderMediaTab(game, kind);
   toast(`Added: ${valid.length}`);
+}
+
+function filePathsFromDrop(dataTransferOrFiles) {
+  const files = dataTransferOrFiles?.files || dataTransferOrFiles || [];
+  return Array.from(files)
+    .map(file => {
+      try {
+        return file?.path || (webUtils?.getPathForFile ? webUtils.getPathForFile(file) : '');
+      } catch (e) {
+        return file?.path || '';
+      }
+    })
+    .filter(Boolean);
+}
+
+function dropHasFiles(dataTransfer) {
+  return Array.from(dataTransfer?.types || []).includes('Files')
+    || Array.from(dataTransfer?.files || []).length > 0;
 }
 
 async function pickMediaFiles(kind) {
@@ -4169,6 +7034,7 @@ function registerMediaFile(fp, gameId, kind, scope = 'game') {
   const type = inferMediaType(fp);
   const game = S.games.find(item => item.id === gameId);
   const project = S.projects.find(item => item.id === gameId);
+  const drawing = S.drawing?.id === gameId ? ensureDrawingShape(S.drawing) : null;
   const projectMediaOrder = S.media.filter(item => item.gameId === gameId && item.scope === scope && item.kind === kind).length;
   const item = {
     id,
@@ -4187,7 +7053,9 @@ function registerMediaFile(fp, gameId, kind, scope = 'game') {
       ? getActiveMediaCategory(game, kind).id
       : scope === 'projectMedia' && project
         ? getActiveMediaCategory(project, kind).id
-        : 'imgcat_default',
+        : scope === 'drawing' && drawing
+          ? getActiveMediaCategory(drawing, kind).id
+          : 'imgcat_default',
     copied: false,
     createdAt: now(),
     updatedAt: now(),
@@ -4213,6 +7081,19 @@ function removeMedia(mediaId) {
   S.dailyNotes.forEach(note => {
     note.blocks = (note.blocks || []).filter(block => block.mediaId !== mediaId);
   });
+  if (S.notes?.blocks) {
+    S.notes.blocks = S.notes.blocks.filter(block => block.mediaId !== mediaId);
+  }
+  if (S.moodboard?.boards) {
+    S.moodboard.boards.forEach(board => {
+      board.items = (board.items || []).filter(item => item.mediaId !== mediaId);
+      board.updatedAt = now();
+    });
+    S.moodboard.updatedAt = now();
+  }
+  if (S.drawing?.id) {
+    S.drawing.updatedAt = now();
+  }
   S.photoBoards.forEach(board => {
     board.photoIds = (board.photoIds || []).filter(id => id !== mediaId);
   });
@@ -4298,9 +7179,15 @@ function fileUrl(fp) {
 }
 
 function serializeProject() {
+  ensureWorkspaceShape();
   return {
     version: APP_VERSION,
     type: APP_TYPE,
+    createdAt: S.createdAt,
+    notes: S.notes,
+    dailies: S.dailies,
+    moodboard: S.moodboard,
+    drawing: S.drawing,
     dailyNotes: S.dailyNotes,
     photoBoards: S.photoBoards,
     projects: S.projects,
@@ -4342,18 +7229,33 @@ async function openProject() {
   }, 30);
 }
 
+function detectProjectCreatedAt(data, fp) {
+  if (data?.createdAt) return data.createdAt;
+  try {
+    const stat = fs.statSync(fp);
+    const date = stat.birthtime || stat.ctime || stat.mtime;
+    if (date && !Number.isNaN(date.getTime())) return date.toISOString();
+  } catch (e) {}
+  return now();
+}
+
 function loadProjectData(data, fp) {
   stopViewer();
   sessionCacheClear();
   const next = freshState();
   next.projectPath = fp;
   next.projectName = nodePath.basename(fp, '.refboard');
+  next.createdAt = detectProjectCreatedAt(data, fp);
   next.modified = false;
 
   if (data.type === APP_TYPE && Number(data.version || 0) >= 2) {
     next.questionTemplates = [];
     next.games = Array.isArray(data.games) ? data.games.map(ensureGameShape).map(gameWithoutQuestions) : [];
     next.dailyNotes = Array.isArray(data.dailyNotes) ? data.dailyNotes.map(ensureDailyNoteShape) : [];
+    next.notes = data.notes ? ensureNotesShape(data.notes) : notesFromLegacyDailyNotes(next.dailyNotes);
+    next.dailies = ensureDailiesShape(data.dailies ? { ...data.dailies, createdAt: data.dailies.createdAt || next.createdAt } : { createdAt: next.createdAt });
+    next.moodboard = ensureMoodboardShape(data.moodboard);
+    next.drawing = ensureDrawingShape(data.drawing);
     next.photoBoards = Array.isArray(data.photoBoards) ? data.photoBoards.map(ensurePhotoBoardShape) : [];
     next.projects = Array.isArray(data.projects) ? data.projects.map(ensureProjectShape) : [];
     next.media = Array.isArray(data.media) ? data.media.map(ensureMediaShape) : [];
@@ -4363,6 +7265,10 @@ function loadProjectData(data, fp) {
     next.games = migrated.games.map(ensureGameShape).map(gameWithoutQuestions);
     next.media = migrated.media.map(ensureMediaShape);
     next.dailyNotes = [];
+    next.notes = ensureNotesShape({ blocks: [] });
+    next.dailies = ensureDailiesShape({ createdAt: next.createdAt });
+    next.moodboard = ensureMoodboardShape();
+    next.drawing = ensureDrawingShape();
     next.photoBoards = [];
     next.projects = [];
   }
@@ -4377,6 +7283,9 @@ function loadProjectData(data, fp) {
   next.activeProjectTab = 'doc';
   next.activeMilestoneId = null;
   next.activeKanbanBoardId = null;
+  next.activeDailyDate = todayISO();
+  next.dailyCalendarMonth = monthISO(todayISO());
+  next.activeMoodboardId = next.moodboard?.activeBoardId || null;
   S = next;
   navStack = [];
   renderApp();
@@ -4891,7 +7800,7 @@ function initControls() {
   document.addEventListener('drop', rememberScrollState, true);
 
   document.querySelectorAll('.nav-btn').forEach(btn => {
-    btn.onclick = () => setView(btn.dataset.view);
+    btn.onclick = () => handleMainNavClick(btn.dataset.view);
   });
   if ($('quick-new-game')) $('quick-new-game').onclick = createGameFlow;
 
@@ -4974,12 +7883,30 @@ function initControls() {
         closeTaskNotebook();
         return;
       }
+      if (S.view === 'moodboard' && S.moodboard?.boardOpen && moodboardSelectionIds(getActiveMoodboard()).length) {
+        e.preventDefault();
+        clearMoodboardSelection();
+        renderMoodboard();
+        return;
+      }
       e.preventDefault();
       goBack();
       return;
     }
     if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
     const k = e.key.toLowerCase();
+    if ((e.ctrlKey || e.metaKey) && k === 'z' && S.view === 'moodboard') {
+      e.preventDefault();
+      undoMoodboard();
+      return;
+    }
+    if ((e.ctrlKey || e.metaKey) && k === 'a' && S.view === 'moodboard' && S.moodboard?.boardOpen) {
+      e.preventDefault();
+      const board = getActiveMoodboard();
+      setMoodboardSelection((board?.items || []).map(item => item.id), board);
+      renderMoodboard();
+      return;
+    }
     if (k === ' ') {
       e.preventDefault();
       $('pb-play').click();
@@ -5009,6 +7936,12 @@ function initControls() {
       }
     }
   });
+
+  setInterval(() => {
+    if (!S.dailies?.enabled) return;
+    const changed = ensureDailiesReady();
+    if (changed && S.view === 'dailies') renderDailies();
+  }, 60000);
 }
 
 function stepPlayback(dir) {
