@@ -79,7 +79,12 @@ const DAILY_COLUMNS = [
 
 const DAILY_TABS = ['today', 'defaults', 'calendar'];
 
-const GAME_TABS = ['notes', 'photos', 'videos', 'sound'];
+const GAME_TABS = ['notes', 'photos', 'videos', 'sound', 'board'];
+
+const PAINT_TOOLS = [['select', 'Select']];
+
+const PAINT_BACKGROUND = '#111315';
+const PAINT_GRID_SIZE = 40;
 
 function normalizeGameTab(tab) {
   return GAME_TABS.includes(tab) ? tab : 'notes';
@@ -152,6 +157,10 @@ let V = {
   moodboardHistory: [],
   moodboardSelection: [],
   moodboardViewportReady: {},
+  paintHistory: {},
+  paintViewportReady: {},
+  paintSelection: null,
+  paintConnectorFrom: null,
 };
 
 let activeGifCache = null;
@@ -545,6 +554,274 @@ function ensurePhotoBoardShape(board) {
   return board;
 }
 
+function defaultPaintCategory() {
+  return { id: 'paintcat_default', title: 'Main', createdAt: now(), updatedAt: now() };
+}
+
+function ensurePaintCategoryShape(category, fallback = 'Main') {
+  if (!category || typeof category !== 'object') category = {};
+  category.id ??= 'paintcat_' + uid();
+  category.title ??= fallback;
+  category.createdAt ??= now();
+  category.updatedAt ??= now();
+  return category;
+}
+
+function createPaintBoard(title = 'Board', categoryId = 'paintcat_default') {
+  return ensurePaintBoardShape({
+    id: 'pboard_' + uid(),
+    title,
+    categoryId,
+    elements: [],
+    zoom: 1,
+    panX: 0,
+    panY: 0,
+    tool: 'select',
+    color: '#5d6674',
+    fillColor: '#181b20',
+    lineWidth: 4,
+    fontSize: 28,
+    fillShapes: false,
+    background: PAINT_BACKGROUND,
+    createdAt: now(),
+    updatedAt: now(),
+  });
+}
+
+function ensurePaintWorkspaceShape(workspace) {
+  if (!workspace || typeof workspace !== 'object') workspace = {};
+  workspace.categories = Array.isArray(workspace.categories) && workspace.categories.length
+    ? workspace.categories.map((category, index) => ensurePaintCategoryShape(category, index ? 'Category' : 'Main'))
+    : [defaultPaintCategory()];
+  workspace.activeCategoryId ??= workspace.categories[0]?.id || null;
+  if (!workspace.categories.some(category => sameId(category.id, workspace.activeCategoryId))) {
+    workspace.activeCategoryId = workspace.categories[0]?.id || null;
+  }
+  workspace.boards = Array.isArray(workspace.boards) && workspace.boards.length
+    ? workspace.boards.map(board => ensurePaintBoardShape(board, workspace.activeCategoryId || workspace.categories[0]?.id))
+    : [createPaintBoard('Board 1', workspace.activeCategoryId || workspace.categories[0]?.id)];
+  workspace.activeBoardId ??= workspace.boards[0]?.id || null;
+  if (!workspace.boards.some(board => sameId(board.id, workspace.activeBoardId))) {
+    workspace.activeBoardId = workspace.boards[0]?.id || null;
+  }
+  workspace.boardOpen = workspace.boardOpen === true;
+  workspace.createdAt ??= now();
+  workspace.updatedAt ??= now();
+  return workspace;
+}
+
+function ensurePaintBoardShape(board, fallbackCategoryId = 'paintcat_default') {
+  if (!board || typeof board !== 'object') board = {};
+  board.id ??= 'pboard_' + uid();
+  board.title ??= 'Board';
+  board.categoryId ??= fallbackCategoryId || 'paintcat_default';
+  board.elements = Array.isArray(board.elements) ? board.elements.map(ensurePaintElementShape).filter(Boolean) : [];
+  board.zoom = clampNumber(board.zoom, 1, 0.05, 20);
+  board.panX = paintNumber(board.panX, 0);
+  board.panY = paintNumber(board.panY, 0);
+  board.tool = 'select';
+  board.color = paintColor(board.color, '#5d6674');
+  board.fillColor = paintColor(board.fillColor, '#181b20');
+  board.lineWidth = clampNumber(board.lineWidth, 4, 1, 72);
+  board.fontSize = clampNumber(board.fontSize, 28, 10, 96);
+  board.fillShapes = board.fillShapes === true;
+  board.background = paintColor(board.background, PAINT_BACKGROUND);
+  if (board.background === '#f4f1e8') board.background = PAINT_BACKGROUND;
+  board.createdAt ??= now();
+  board.updatedAt ??= now();
+  return board;
+}
+
+function ensurePaintElementShape(element) {
+  if (!element || typeof element !== 'object') return null;
+  element.id ??= 'pel_' + uid();
+  element.type ??= 'path';
+  element.color = paintColor(element.color, '#d7dce3');
+  element.fill = element.fill === 'transparent' ? 'transparent' : paintColor(element.fill, 'transparent');
+  element.width = clampNumber(element.width, 4, 1, 96);
+  element.z = clampNumber(element.z, 1, 1, 1000000);
+  element.createdAt ??= now();
+  element.updatedAt ??= now();
+
+  if (element.type === 'path') {
+    element.tool = element.tool === 'eraser' ? 'eraser' : element.tool === 'brush' ? 'brush' : 'pencil';
+    element.points = Array.isArray(element.points)
+      ? element.points.map(paintPoint).filter(Boolean)
+      : [];
+    return element.points.length ? element : null;
+  }
+  if (element.type === 'line' || element.type === 'arrow') {
+    element.x1 = paintNumber(element.x1, 0);
+    element.y1 = paintNumber(element.y1, 0);
+    element.x2 = paintNumber(element.x2, element.x1 + 1);
+    element.y2 = paintNumber(element.y2, element.y1 + 1);
+    return element;
+  }
+  if (element.type === 'connector') {
+    element.fromId ??= null;
+    element.toId ??= null;
+    element.fromSide = ['n', 'e', 's', 'w'].includes(element.fromSide) ? element.fromSide : 's';
+    element.toSide = ['n', 'e', 's', 'w'].includes(element.toSide) ? element.toSide : 'n';
+    element.x1 = paintNumber(element.x1, 0);
+    element.y1 = paintNumber(element.y1, 0);
+    element.x2 = paintNumber(element.x2, element.x1 + PAINT_GRID_SIZE);
+    element.y2 = paintNumber(element.y2, element.y1 + PAINT_GRID_SIZE);
+    return element;
+  }
+  if (element.type === 'rect' || element.type === 'ellipse' || element.type === 'image' || element.type === 'note' || element.type === 'block') {
+    element.x = paintNumber(element.x, 0);
+    element.y = paintNumber(element.y, 0);
+    element.w = clampNumber(element.w, element.type === 'note' || element.type === 'block' ? 260 : 160, 24, 5000);
+    element.h = clampNumber(element.h, element.type === 'note' || element.type === 'block' ? 150 : 120, 24, 5000);
+    element.text ??= '';
+    element.fontSize = clampNumber(element.fontSize, element.type === 'block' ? 14 : 18, 10, 120);
+    return element;
+  }
+  if (element.type === 'text') {
+    element.x = paintNumber(element.x, 0);
+    element.y = paintNumber(element.y, 0);
+    element.w = clampNumber(element.w, 260, 40, 5000);
+    element.h = clampNumber(element.h, 60, 20, 2000);
+    element.fontSize = clampNumber(element.fontSize, 28, 10, 120);
+    element.text ??= 'Text';
+    return element;
+  }
+  return null;
+}
+
+function paintNumber(value, fallback = 0) {
+  const next = Number(value);
+  return Number.isFinite(next) ? next : fallback;
+}
+
+function paintPoint(point) {
+  if (!point || typeof point !== 'object') return null;
+  return { x: paintNumber(point.x, 0), y: paintNumber(point.y, 0) };
+}
+
+function paintColor(value, fallback) {
+  if (value === 'transparent') return value;
+  const text = String(value || '');
+  return /^#[0-9a-f]{6}$/i.test(text) ? text : fallback;
+}
+
+function paintToolButtonHTML(id, label, activeId) {
+  return `
+    <button class="paint-tool-btn ${activeId === id ? 'active' : ''}" data-paint-tool="${esc(id)}" title="${esc(label)}" aria-label="${esc(label)}">
+      ${paintToolIconHTML(id)}
+      <span>${esc(label)}</span>
+    </button>`;
+}
+
+function paintToolIconHTML(id) {
+  const icons = {
+    select: '<path d="M5 4l8 8-4 1-2 5-2-1.5 2-4-4-2z"/>',
+    block: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="M7 10h10M7 14h7"/>',
+    connector: '<path d="M6 7c7 0 5 10 12 10"/><path d="M15 14l3 3-4 2"/>',
+    pencil: '<path d="M4 17l1 3 3-1L18 9l-4-4z"/><path d="M13 6l4 4"/>',
+    brush: '<path d="M14 4l6 6-7 7-6-6z"/><path d="M4 14c2 1 3 3 1 6 3 0 5-2 6-5"/>',
+    eraser: '<path d="M4 14l8-8 8 8-5 5H9z"/><path d="M9 19h11"/>',
+    fill: '<path d="M5 12l7-7 7 7-7 7z"/><path d="M15 15h6v5h-6z"/>',
+    picker: '<path d="M14 4l6 6-3 3-6-6z"/><path d="M13 8l-8 8v4h4l8-8"/>',
+    line: '<path d="M5 19L19 5"/>',
+    arrow: '<path d="M5 19L19 5"/><path d="M12 5h7v7"/>',
+    rect: '<rect x="5" y="6" width="14" height="12" rx="1"/>',
+    ellipse: '<ellipse cx="12" cy="12" rx="8" ry="6"/>',
+    text: '<path d="M5 6h14M12 6v13M9 19h6"/>',
+    note: '<path d="M6 4h9l3 3v13H6z"/><path d="M15 4v4h4M9 12h6M9 16h5"/>',
+    pan: '<path d="M7 12V8a2 2 0 0 1 4 0v3"/><path d="M11 11V7a2 2 0 0 1 4 0v5"/><path d="M15 12V9a2 2 0 0 1 4 0v5c0 4-2 7-6 7h-1c-3 0-5-2-7-6"/>',
+  };
+  return `<svg class="paint-tool-icon" viewBox="0 0 24 24" aria-hidden="true">${icons[id] || icons.select}</svg>`;
+}
+
+function paintSnap(value) {
+  return Math.round(Number(value || 0) / PAINT_GRID_SIZE) * PAINT_GRID_SIZE;
+}
+
+function paintSnapPoint(point) {
+  return { x: paintSnap(point.x), y: paintSnap(point.y) };
+}
+
+function paintIsTileElement(element) {
+  return ['block', 'note', 'text', 'image', 'rect', 'ellipse'].includes(element?.type);
+}
+
+function paintElementHasInlineText(element) {
+  return ['block', 'note', 'text'].includes(element?.type);
+}
+
+function paintIsTextTopElement(element) {
+  return ['text', 'note', 'block'].includes(element?.type);
+}
+
+function paintVisualZ(element) {
+  if (element?.type === 'connector') return Number(element.z || 1);
+  if (paintIsTextTopElement(element)) return 200000 + Number(element.z || 1);
+  return 50000 + Number(element?.z || 1);
+}
+
+function paintElementCenter(element, board = null) {
+  if (!element) return null;
+  if (paintIsTileElement(element)) {
+    return {
+      x: Number(element.x || 0) + Number(element.w || 0) / 2,
+      y: Number(element.y || 0) + Number(element.h || 0) / 2,
+    };
+  }
+  const bounds = paintElementBounds(element, board);
+  return bounds ? { x: bounds.x + bounds.w / 2, y: bounds.y + bounds.h / 2 } : null;
+}
+
+function paintAnchorForElement(element, side = 's') {
+  if (!element) return { x: 0, y: 0 };
+  const x = Number(element.x || 0);
+  const y = Number(element.y || 0);
+  const w = Number(element.w || 0);
+  const h = Number(element.h || 0);
+  if (side === 'n') return { x: x + w / 2, y };
+  if (side === 'e') return { x: x + w, y: y + h / 2 };
+  if (side === 'w') return { x, y: y + h / 2 };
+  return { x: x + w / 2, y: y + h };
+}
+
+function getPaintWorkspaceForOwner(owner) {
+  owner.paintBoards = ensurePaintWorkspaceShape(owner.paintBoards);
+  return owner.paintBoards;
+}
+
+function getPaintCategories(workspace) {
+  ensurePaintWorkspaceShape(workspace);
+  return workspace.categories;
+}
+
+function getActivePaintCategory(workspace) {
+  ensurePaintWorkspaceShape(workspace);
+  let category = workspace.categories.find(item => sameId(item.id, workspace.activeCategoryId));
+  if (!category) {
+    category = workspace.categories[0];
+    workspace.activeCategoryId = category?.id || null;
+  }
+  return category;
+}
+
+function setActivePaintCategory(workspace, categoryId) {
+  ensurePaintWorkspaceShape(workspace);
+  const category = workspace.categories.find(item => sameId(item.id, categoryId)) || workspace.categories[0];
+  workspace.activeCategoryId = category?.id || null;
+  return category;
+}
+
+function getActivePaintBoard(workspace) {
+  ensurePaintWorkspaceShape(workspace);
+  let board = workspace.boards.find(item => sameId(item.id, workspace.activeBoardId));
+  if (!board) {
+    const category = getActivePaintCategory(workspace);
+    board = workspace.boards.find(item => sameId(item.categoryId, category?.id)) || workspace.boards[0] || null;
+    workspace.activeBoardId = board?.id || null;
+  }
+  return board;
+}
+
 function createKanbanBoard(title = 'Ideas') {
   return {
     id: 'kb_' + uid(),
@@ -626,6 +903,7 @@ function ensureProjectShape(project) {
   ensureMediaCategoryBucket(project, 'photo');
   ensureMediaCategoryBucket(project, 'video');
   ensureMediaCategoryBucket(project, 'sound');
+  project.paintBoards = ensurePaintWorkspaceShape(project.paintBoards);
   project.milestones = Array.isArray(project.milestones) && project.milestones.length
     ? project.milestones.map(ensureMilestoneShape)
     : [createMilestone('Milestone 1')];
@@ -718,8 +996,9 @@ function createDailyTemplate(title = 'Daily quest') {
     title,
     notes: '',
     importance: 'common',
+    categoryId: S.dailies?.activeTemplateCategoryId || 'dtcat_default',
     enabled: true,
-    order: S.dailies?.templates?.length || 0,
+    order: dailyTemplatesForCategory(S.dailies?.activeTemplateCategoryId).length,
     createdAt: now(),
     updatedAt: now(),
   });
@@ -729,12 +1008,39 @@ function ensureDailyTemplateShape(template, index = 0) {
   template.id ??= 'dt_' + uid();
   template.title ??= 'Daily quest';
   template.notes ??= '';
+  template.categoryId ??= 'dtcat_default';
   template.importance = importanceLevel(template.importance).id;
   template.enabled = template.enabled !== false;
   template.order = Number.isFinite(Number(template.order)) ? Number(template.order) : index;
   template.createdAt ??= now();
   template.updatedAt ??= now();
   return template;
+}
+
+function defaultDailyTemplateCategory() {
+  return { id: 'dtcat_default', title: 'Default', createdAt: now(), updatedAt: now() };
+}
+
+function ensureDailyTemplateCategoryShape(category, index = 0) {
+  if (!category || typeof category !== 'object') category = {};
+  category.id ??= 'dtcat_' + uid();
+  category.title ??= index ? 'Preset' : 'Default';
+  category.createdAt ??= now();
+  category.updatedAt ??= now();
+  return category;
+}
+
+function getActiveDailyTemplateCategory() {
+  ensureDailiesShape(S.dailies);
+  return S.dailies.templateCategories.find(category => sameId(category.id, S.dailies.activeTemplateCategoryId))
+    || S.dailies.templateCategories[0];
+}
+
+function dailyTemplatesForCategory(categoryId = getActiveDailyTemplateCategory()?.id) {
+  return (S.dailies?.templates || [])
+    .map(ensureDailyTemplateShape)
+    .filter(template => sameId(template.categoryId, categoryId))
+    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 }
 
 function createDailyQuest(title = 'Daily quest', source = 'manual') {
@@ -791,10 +1097,8 @@ function createDailyDay(date = todayISO()) {
     createdAt: now(),
     updatedAt: now(),
   });
-  const templates = [...(S.dailies?.templates || [])]
-    .map(ensureDailyTemplateShape)
-    .filter(template => template.enabled !== false)
-    .sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+  const templates = dailyTemplatesForCategory(S.dailies?.activeTemplateCategoryId)
+    .filter(template => template.enabled !== false);
   day.columns.todo = templates.map(createDailyQuestFromTemplate);
   return day;
 }
@@ -838,9 +1142,20 @@ function ensureDailiesShape(dailies) {
       .filter(range => String(range.from) <= String(range.to))
     : [];
   dailies.activeTab = DAILY_TABS.includes(dailies.activeTab) ? dailies.activeTab : 'today';
+  dailies.templateCategories = Array.isArray(dailies.templateCategories) && dailies.templateCategories.length
+    ? dailies.templateCategories.map(ensureDailyTemplateCategoryShape)
+    : [defaultDailyTemplateCategory()];
+  dailies.activeTemplateCategoryId ??= dailies.templateCategories[0]?.id || 'dtcat_default';
+  if (!dailies.templateCategories.some(category => sameId(category.id, dailies.activeTemplateCategoryId))) {
+    dailies.activeTemplateCategoryId = dailies.templateCategories[0]?.id || 'dtcat_default';
+  }
   dailies.templates = Array.isArray(dailies.templates)
     ? dailies.templates.map(ensureDailyTemplateShape).sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
     : [];
+  const categoryIds = new Set(dailies.templateCategories.map(category => category.id));
+  dailies.templates.forEach(template => {
+    if (!categoryIds.has(template.categoryId)) template.categoryId = dailies.templateCategories[0].id;
+  });
   dailies.days = Array.isArray(dailies.days)
     ? dailies.days.map(ensureDailyDayShape)
     : [];
@@ -1853,6 +2168,7 @@ function ensureGameShape(game) {
   ensureMediaCategoryBucket(game, 'photo');
   ensureMediaCategoryBucket(game, 'video');
   ensureMediaCategoryBucket(game, 'sound');
+  game.paintBoards = ensurePaintWorkspaceShape(game.paintBoards);
   game.answers ??= {};
   game.notes = ensureBlockContainerShape(game.notes);
   game.collapsedQuestions ??= [];
@@ -2861,7 +3177,7 @@ function buildDailyExtraCard(day, quest, rerender) {
   ensureDailyQuestShape(quest);
   const done = !!quest.completedAt;
   const card = document.createElement('div');
-  card.className = `task-card daily-task-card daily-extra-card task-importance-${esc(importanceLevel(quest.importance).id)}${done ? ' done' : ''}`;
+  card.className = `task-card daily-task-card daily-extra-card task-importance-${esc(importanceLevel(quest.importance).id)}${done ? ' done task-done' : ''}`;
   card.draggable = true;
   card.addEventListener('dragstart', e => {
     if (e.target.closest('input, textarea, button, .rarity-badge')) { e.preventDefault(); return; }
@@ -2878,11 +3194,12 @@ function buildDailyExtraCard(day, quest, rerender) {
     <div class="task-card-top daily-task-top">
       ${importanceBadgeHTML(quest.importance)}
       <input class="daily-task-title-input daily-extra-title" value="${esc(quest.title || '')}">
+      ${done ? '<span class="task-done-mark">Done</span>' : ''}
       <button class="mini-btn daily-extra-toggle">${done ? 'Return' : 'Done'}</button>
     </div>
     <textarea class="daily-task-notes daily-extra-notes" placeholder="Extra note...">${esc(quest.notes || '')}</textarea>
     <div class="daily-task-foot">
-      <span>${done ? 'done' : 'extra'}</span>
+      <span>${done ? `done${quest.completedAt ? ` ${formatShortDate(quest.completedAt)}` : ''}` : 'extra'}</span>
       <button class="mini-btn danger-lite daily-extra-delete">Delete</button>
     </div>`;
   bindImportanceTriggers(card, () => quest.importance, value => {
@@ -3223,7 +3540,8 @@ function moveDailyQuestFromExtra(day, taskId, toColumn, rerender) {
 function buildDailyQuestCard(day, columnKey, quest, rerender) {
   ensureDailyQuestShape(quest);
   const card = document.createElement('div');
-  card.className = `task-card daily-task-card task-importance-${esc(importanceLevel(quest.importance).id)}`;
+  const done = columnKey === 'done' || !!quest.completedAt;
+  card.className = `task-card daily-task-card task-importance-${esc(importanceLevel(quest.importance).id)}${done ? ' task-done' : ''}`;
   card.draggable = true;
   card.addEventListener('dragstart', e => {
     if (e.target.closest('input, textarea, button, .rarity-badge')) {
@@ -3245,11 +3563,12 @@ function buildDailyQuestCard(day, columnKey, quest, rerender) {
     <div class="task-card-top daily-task-top">
       ${importanceBadgeHTML(quest.importance)}
       <input class="daily-task-title-input" value="${esc(quest.title || '')}">
+      ${done ? '<span class="task-done-mark">Done</span>' : ''}
       <button class="mini-btn daily-complete-btn">${esc(actionLabel)}</button>
     </div>
     <textarea class="daily-task-notes" placeholder="Quest note...">${esc(quest.notes || '')}</textarea>
     <div class="daily-task-foot">
-      <span>${quest.source === 'default' ? 'default' : 'manual'}</span>
+      <span>${done ? `done${quest.completedAt ? ` ${formatShortDate(quest.completedAt)}` : ''}` : quest.source === 'default' ? 'default' : 'manual'}</span>
       <button class="mini-btn danger-lite daily-delete-quest">Delete</button>
     </div>`;
   bindImportanceTriggers(card, () => quest.importance, value => {
@@ -3338,27 +3657,36 @@ function refreshDailyStatusForDate(date) {
 }
 
 function renderDailyDefaults(content) {
-  const templates = S.dailies.templates;
+  const activeCategory = getActiveDailyTemplateCategory();
+  const templates = dailyTemplatesForCategory(activeCategory.id);
   content.innerHTML = `
     <div class="daily-defaults">
       <div class="toolbar">
         <div class="toolbar-left">
-          <div class="eyebrow">Default quests</div>
+          <div class="eyebrow">Default quests / ${esc(activeCategory.title)}</div>
         </div>
         <div class="toolbar-right">
           <button class="ghost-btn" id="apply-defaults-today">Apply to today</button>
+          <button class="ghost-btn" id="add-daily-template-category">+ Category</button>
+          <button class="ghost-btn" id="rename-daily-template-category">Rename</button>
+          <button class="mini-btn danger-lite" id="delete-daily-template-category">Delete Category</button>
           <button class="inline-btn" id="add-daily-template">+ Quest</button>
         </div>
       </div>
+      <div class="daily-template-categories" id="daily-template-categories"></div>
       <div class="daily-template-list" id="daily-template-list"></div>
     </div>`;
   $('add-daily-template').onclick = () => addDailyTemplateFlow();
+  $('add-daily-template-category').onclick = addDailyTemplateCategoryFlow;
+  $('rename-daily-template-category').onclick = renameDailyTemplateCategory;
+  $('delete-daily-template-category').onclick = deleteDailyTemplateCategory;
   $('apply-defaults-today').onclick = () => {
-    const added = applyDefaultTemplatesToDay(getOrCreateDailyDay(todayISO()));
+    const added = applyDefaultTemplatesToDay(getOrCreateDailyDay(todayISO()), activeCategory.id);
     markDirty();
     renderDailies();
     toast(added ? `Added: ${added}` : 'Already added');
   };
+  renderDailyTemplateCategoryTabs();
   const list = $('daily-template-list');
   if (!templates.length) {
     list.innerHTML = `
@@ -3412,12 +3740,12 @@ function renderDailyDefaults(content) {
       S.dailies.updatedAt = now();
       markDirty();
     };
-    card.querySelector('.daily-template-up').onclick = () => moveDailyTemplate(index, -1);
-    card.querySelector('.daily-template-down').onclick = () => moveDailyTemplate(index, 1);
+    card.querySelector('.daily-template-up').onclick = () => moveDailyTemplate(template.id, -1);
+    card.querySelector('.daily-template-down').onclick = () => moveDailyTemplate(template.id, 1);
     card.querySelector('.daily-template-delete').onclick = () => {
       if (!confirm(`Delete "${template.title}"?`)) return;
       S.dailies.templates = S.dailies.templates.filter(item => item.id !== template.id);
-      normalizeDailyTemplateOrder();
+      normalizeDailyTemplateOrder(template.categoryId);
       S.dailies.updatedAt = now();
       markDirty();
       renderDailies();
@@ -3426,38 +3754,111 @@ function renderDailyDefaults(content) {
   });
 }
 
-function addDailyTemplateFlow() {
-  askText('New Default Quest', '', 'Create', title => {
-    S.dailies.templates.push(createDailyTemplate(title));
-    normalizeDailyTemplateOrder();
+function renderDailyTemplateCategoryTabs() {
+  const wrap = $('daily-template-categories');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  S.dailies.templateCategories.forEach(category => {
+    const btn = document.createElement('button');
+    btn.className = 'chip-btn' + (sameId(category.id, S.dailies.activeTemplateCategoryId) ? ' active' : '');
+    btn.textContent = `${category.title} (${dailyTemplatesForCategory(category.id).length})`;
+    btn.onclick = () => {
+      S.dailies.activeTemplateCategoryId = category.id;
+      S.dailies.updatedAt = now();
+      markDirty();
+      renderDailies();
+    };
+    wrap.appendChild(btn);
+  });
+}
+
+function addDailyTemplateCategoryFlow() {
+  askText('New Daily Template Category', '', 'Create', title => {
+    const category = ensureDailyTemplateCategoryShape({ id: 'dtcat_' + uid(), title, createdAt: now(), updatedAt: now() }, S.dailies.templateCategories.length);
+    S.dailies.templateCategories.push(category);
+    S.dailies.activeTemplateCategoryId = category.id;
     S.dailies.updatedAt = now();
     markDirty();
     renderDailies();
   });
 }
 
-function normalizeDailyTemplateOrder() {
-  S.dailies.templates.forEach((template, index) => {
-    template.order = index;
-    template.updatedAt = now();
+function renameDailyTemplateCategory() {
+  const category = getActiveDailyTemplateCategory();
+  if (!category) return;
+  askText('Rename Template Category', category.title || '', 'Save', title => {
+    category.title = title;
+    category.updatedAt = now();
+    S.dailies.updatedAt = now();
+    markDirty();
+    renderDailies();
   });
 }
 
-function moveDailyTemplate(index, offset) {
-  const to = index + offset;
-  if (to < 0 || to >= S.dailies.templates.length) return;
-  const [template] = S.dailies.templates.splice(index, 1);
-  S.dailies.templates.splice(to, 0, template);
-  normalizeDailyTemplateOrder();
+function deleteDailyTemplateCategory() {
+  const category = getActiveDailyTemplateCategory();
+  if (!category) return;
+  if (S.dailies.templateCategories.length <= 1) {
+    toast('Keep one category');
+    return;
+  }
+  if (!confirm(`Delete category "${category.title}"? Its quests move to the first category.`)) return;
+  const next = S.dailies.templateCategories.find(item => !sameId(item.id, category.id));
+  S.dailies.templates.forEach(template => {
+    if (sameId(template.categoryId, category.id)) template.categoryId = next.id;
+  });
+  S.dailies.templateCategories = S.dailies.templateCategories.filter(item => !sameId(item.id, category.id));
+  S.dailies.activeTemplateCategoryId = next.id;
+  normalizeDailyTemplateOrder(next.id);
   S.dailies.updatedAt = now();
   markDirty();
   renderDailies();
 }
 
-function applyDefaultTemplatesToDay(day) {
+function addDailyTemplateFlow() {
+  askText('New Default Quest', '', 'Create', title => {
+    S.dailies.templates.push(createDailyTemplate(title));
+    normalizeDailyTemplateOrder(S.dailies.activeTemplateCategoryId);
+    S.dailies.updatedAt = now();
+    markDirty();
+    renderDailies();
+  });
+}
+
+function normalizeDailyTemplateOrder(categoryId = null) {
+  const categoryIds = categoryId
+    ? [categoryId]
+    : (S.dailies.templateCategories || []).map(category => category.id);
+  categoryIds.forEach(id => {
+    dailyTemplatesForCategory(id).forEach((template, index) => {
+      template.order = index;
+      template.updatedAt = now();
+    });
+  });
+}
+
+function moveDailyTemplate(templateId, offset) {
+  const template = S.dailies.templates.find(item => sameId(item.id, templateId));
+  if (!template) return;
+  const list = dailyTemplatesForCategory(template.categoryId);
+  const index = list.findIndex(item => sameId(item.id, template.id));
+  const to = index + offset;
+  if (index < 0 || to < 0 || to >= list.length) return;
+  const [moved] = list.splice(index, 1);
+  list.splice(to, 0, moved);
+  list.forEach((item, nextIndex) => {
+    item.order = nextIndex;
+    item.updatedAt = now();
+  });
+  S.dailies.updatedAt = now();
+  markDirty();
+  renderDailies();
+}
+
+function applyDefaultTemplatesToDay(day, categoryId = getActiveDailyTemplateCategory()?.id) {
   const existing = new Set(DAILY_COLUMNS.flatMap(([key]) => (day.columns[key] || []).map(quest => quest.sourceTemplateId)).filter(Boolean));
   let added = 0;
-  S.dailies.templates
+  dailyTemplatesForCategory(categoryId)
     .filter(template => template.enabled !== false)
     .forEach(template => {
       if (existing.has(template.id)) return;
@@ -5497,6 +5898,7 @@ function renderProjectWorkspace(project) {
   const tabs = [
     ['doc', 'Design Doc'],
     ['notes', 'Notes'],
+    ['board', 'Board'],
     ['images', 'Images'],
     ['videos', 'Video'],
     ['audio', 'Audio'],
@@ -5550,6 +5952,7 @@ function renderProjectWorkspace(project) {
   });
 
   if (S.activeProjectTab === 'kanban') renderProjectKanban(project);
+  else if (S.activeProjectTab === 'board') renderProjectPaintBoard(project);
   else if (S.activeProjectTab === 'notes') renderProjectNotes(project);
   else if (S.activeProjectTab === 'images') renderProjectMediaTab(project, 'photo');
   else if (S.activeProjectTab === 'videos') renderProjectMediaTab(project, 'video');
@@ -5821,6 +6224,1269 @@ async function addProjectMedia(project, kind) {
   toast(`Added: ${files.length}`);
 }
 
+function renderProjectPaintBoard(project) {
+  renderPaintWorkspace(project, 'project', 'project-tab-content');
+}
+
+function renderGamePaintBoard(game) {
+  renderPaintWorkspace(game, 'game', 'tab-content');
+}
+
+function renderPaintWorkspace(owner, ownerKind, mountId) {
+  ensurePaintOwner(owner, ownerKind);
+  const workspace = getPaintWorkspaceForOwner(owner);
+  const content = $(mountId);
+  if (!content) return;
+  if (!workspace.boardOpen) {
+    renderPaintBoardLibrary(owner, ownerKind, workspace, content);
+    return;
+  }
+  const board = getActivePaintBoard(workspace);
+  if (!board) {
+    workspace.boardOpen = false;
+    renderPaintBoardLibrary(owner, ownerKind, workspace, content);
+    return;
+  }
+  renderPaintBoardCanvas(owner, ownerKind, workspace, board, content);
+}
+
+function ensurePaintOwner(owner, ownerKind) {
+  if (ownerKind === 'project') ensureProjectShape(owner);
+  else ensureGameShape(owner);
+}
+
+function rerenderPaintWorkspace(owner, ownerKind) {
+  if (ownerKind === 'project') renderProjectPaintBoard(owner);
+  else renderGamePaintBoard(owner);
+}
+
+function touchPaintOwner(owner, ownerKind) {
+  if (ownerKind === 'project') touchProject(owner);
+  else touchGame(owner.id);
+}
+
+function touchPaintWorkspace(owner, ownerKind, workspace, board) {
+  const stamp = now();
+  if (board) board.updatedAt = stamp;
+  if (workspace) workspace.updatedAt = stamp;
+  touchPaintOwner(owner, ownerKind);
+  markDirty();
+}
+
+function paintCategoryCount(workspace, categoryId) {
+  return (workspace.boards || []).filter(board => sameId(board.categoryId, categoryId)).length;
+}
+
+function paintCategoryControlsHTML(workspace) {
+  const active = getActivePaintCategory(workspace);
+  return `
+    <div class="category-controls media-category-controls paint-category-controls">
+      <button type="button" class="category-menu-btn" id="paint-category">
+        <span>${esc(active?.title || 'Main')}</span>
+        <small>${paintCategoryCount(workspace, active?.id)}</small>
+        <span class="select-caret">v</span>
+      </button>
+      <button class="mini-btn" id="paint-category-add">+ Category</button>
+      <button class="mini-btn" id="paint-category-rename">Rename</button>
+      <button class="mini-btn danger-lite" id="paint-category-delete">Delete</button>
+    </div>`;
+}
+
+function bindPaintCategoryControls(owner, ownerKind, workspace) {
+  const categoryBtn = $('paint-category');
+  if (categoryBtn) {
+    categoryBtn.onclick = e => {
+      openCategoryMenu(e.currentTarget, getPaintCategories(workspace), workspace.activeCategoryId, category => {
+        setActivePaintCategory(workspace, category.id);
+        const firstBoard = workspace.boards.find(board => sameId(board.categoryId, category.id));
+        if (firstBoard) workspace.activeBoardId = firstBoard.id;
+        touchPaintWorkspace(owner, ownerKind, workspace);
+        rerenderPaintWorkspace(owner, ownerKind);
+      }, {
+        title: 'Board categories',
+        countFor: category => paintCategoryCount(workspace, category.id),
+      });
+    };
+  }
+  const add = $('paint-category-add');
+  if (add) add.onclick = () => createPaintCategoryFlow(owner, ownerKind, workspace);
+  const rename = $('paint-category-rename');
+  if (rename) rename.onclick = () => renamePaintCategory(owner, ownerKind, workspace);
+  const del = $('paint-category-delete');
+  if (del) del.onclick = () => deletePaintCategory(owner, ownerKind, workspace);
+}
+
+function renderPaintBoardLibrary(owner, ownerKind, workspace, content) {
+  const activeCategory = getActivePaintCategory(workspace);
+  const boards = workspace.boards.filter(board => sameId(board.categoryId, activeCategory?.id));
+  content.innerHTML = `
+    <div class="tab-scroll paint-board-library">
+      <div class="toolbar">
+        <div class="toolbar-left">
+          <div class="eyebrow">Board</div>
+        </div>
+        <div class="toolbar-right">
+          <button class="ghost-btn" id="paint-new-sheet">+ Sheet</button>
+        </div>
+      </div>
+      ${paintCategoryControlsHTML(workspace)}
+      <div class="category-card-grid" id="paint-board-grid"></div>
+    </div>`;
+
+  $('paint-new-sheet').onclick = () => createPaintBoardFlow(owner, ownerKind, workspace);
+  bindPaintCategoryControls(owner, ownerKind, workspace);
+
+  const grid = $('paint-board-grid');
+  if (!boards.length) {
+    const empty = document.createElement('button');
+    empty.className = 'album-drop-card fixed-drop';
+    empty.textContent = '+ Sheet';
+    empty.onclick = () => createPaintBoardFlow(owner, ownerKind, workspace);
+    grid.appendChild(empty);
+    return;
+  }
+
+  boards.forEach(board => {
+    const card = document.createElement('button');
+    card.className = 'category-card media-category-card paint-sheet-card';
+    const cover = getPaintBoardCover(board);
+    card.innerHTML = `
+      <div class="category-card-cover paint-sheet-cover">${cover ? mediaPreviewHTML(cover, true) : '<span class="paint-sheet-mark">B</span>'}</div>
+      <div class="category-card-main">
+        <div class="category-card-title">${esc(board.title)}</div>
+        <div class="card-sub">${(board.elements || []).length} items</div>
+      </div>`;
+    card.onclick = () => {
+      workspace.activeBoardId = board.id;
+      workspace.activeCategoryId = board.categoryId;
+      workspace.boardOpen = true;
+      V.paintSelection = null;
+      touchPaintWorkspace(owner, ownerKind, workspace, board);
+      rerenderPaintWorkspace(owner, ownerKind);
+    };
+    grid.appendChild(card);
+  });
+
+  const add = document.createElement('button');
+  add.className = 'album-drop-card fixed-drop';
+  add.textContent = '+ Sheet';
+  add.onclick = () => createPaintBoardFlow(owner, ownerKind, workspace);
+  grid.appendChild(add);
+}
+
+function getPaintBoardCover(board) {
+  const image = (board.elements || []).find(element => element.type === 'image' && getMediaById(element.mediaId));
+  return image ? getMediaById(image.mediaId) : null;
+}
+
+function createPaintCategoryFlow(owner, ownerKind, workspace) {
+  askText('New Board Category', '', 'Create', title => {
+    const category = ensurePaintCategoryShape({ id: 'paintcat_' + uid(), title, createdAt: now(), updatedAt: now() });
+    workspace.categories.push(category);
+    workspace.activeCategoryId = category.id;
+    touchPaintWorkspace(owner, ownerKind, workspace);
+    rerenderPaintWorkspace(owner, ownerKind);
+  });
+}
+
+function renamePaintCategory(owner, ownerKind, workspace) {
+  const category = getActivePaintCategory(workspace);
+  if (!category) return;
+  askText('Rename Category', category.title || '', 'Save', title => {
+    category.title = title;
+    category.updatedAt = now();
+    touchPaintWorkspace(owner, ownerKind, workspace);
+    rerenderPaintWorkspace(owner, ownerKind);
+  });
+}
+
+function deletePaintCategory(owner, ownerKind, workspace) {
+  const category = getActivePaintCategory(workspace);
+  if (!category) return;
+  if (workspace.categories.length <= 1) {
+    toast('Keep one category');
+    return;
+  }
+  if (!confirm(`Delete category "${category.title}"? Sheets move to the first category.`)) return;
+  const next = workspace.categories.find(item => !sameId(item.id, category.id));
+  workspace.boards.forEach(board => {
+    if (sameId(board.categoryId, category.id)) board.categoryId = next.id;
+  });
+  workspace.categories = workspace.categories.filter(item => !sameId(item.id, category.id));
+  workspace.activeCategoryId = next.id;
+  workspace.activeBoardId = workspace.boards.find(board => sameId(board.categoryId, next.id))?.id || workspace.boards[0]?.id || null;
+  touchPaintWorkspace(owner, ownerKind, workspace);
+  rerenderPaintWorkspace(owner, ownerKind);
+}
+
+function createPaintBoardFlow(owner, ownerKind, workspace) {
+  const category = getActivePaintCategory(workspace);
+  askText('New Board Sheet', '', 'Create', title => {
+    const board = createPaintBoard(title, category?.id || 'paintcat_default');
+    workspace.boards.push(board);
+    workspace.activeBoardId = board.id;
+    workspace.activeCategoryId = board.categoryId;
+    workspace.boardOpen = true;
+    V.paintSelection = null;
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+    rerenderPaintWorkspace(owner, ownerKind);
+  });
+}
+
+function renderPaintBoardCanvas(owner, ownerKind, workspace, board, content) {
+  if (V.paintCleanup) {
+    V.paintCleanup();
+    V.paintCleanup = null;
+  }
+  board = ensurePaintBoardShape(board, workspace.activeCategoryId);
+  workspace.activeBoardId = board.id;
+  workspace.activeCategoryId = board.categoryId;
+  const zoom = board.zoom || 1;
+  content.innerHTML = `
+    <div class="paint-board-shell">
+      <div class="paint-toolbar">
+        <div class="paint-toolbar-row">
+          <div class="paint-title-wrap">
+            <input id="paint-board-title" class="text-input paint-board-title" value="${esc(board.title)}">
+            <span class="moodboard-zoom-label" id="paint-zoom-label">${Math.round(zoom * 100)}%</span>
+          </div>
+          <div class="paint-actions">
+            <button class="ghost-btn" id="paint-back-sheets">Sheets</button>
+            <button class="inline-btn" id="paint-add-block">+ Block</button>
+            <button class="ghost-btn" id="paint-add-photo">+ Photo</button>
+            <button class="ghost-btn" id="paint-undo">Undo</button>
+            <button class="danger-btn" id="paint-delete-selected">Delete</button>
+          </div>
+        </div>
+        <div class="paint-sheet-row">
+          <div class="paint-sheet-tabs" id="paint-sheet-tabs"></div>
+          <button class="ghost-btn paint-sheet-add-btn" id="paint-new-sheet">+ Sheet</button>
+        </div>
+      </div>
+      <div class="paint-viewport" id="paint-viewport" style="background-color:${esc(board.background)}">
+        <div class="paint-canvas" id="paint-canvas"></div>
+        ${!(board.elements || []).length ? `
+        <div class="paint-empty-overlay" id="paint-empty-overlay">
+          <button class="paint-empty-box" id="paint-empty-block">
+            <span class="paint-empty-icon">+</span>
+            <span class="paint-empty-title">Add Block</span>
+          </button>
+        </div>` : ''}
+      </div>
+    </div>`;
+
+  bindPaintToolbar(owner, ownerKind, workspace, board);
+  renderPaintSheetTabs(owner, ownerKind, workspace, board);
+  const viewport = $('paint-viewport');
+  const canvas = $('paint-canvas');
+  applyPaintTransform(canvas, board);
+  renderPaintElements(owner, ownerKind, workspace, board);
+  bindPaintViewport(owner, ownerKind, workspace, board, viewport, canvas);
+  bindPaintDrop(owner, ownerKind, workspace, board, viewport);
+
+  if (!V.paintViewportReady) V.paintViewportReady = {};
+  const readyKey = `${owner.id}:${board.id}`;
+  if (!V.paintViewportReady[readyKey]) {
+    V.paintViewportReady[readyKey] = true;
+    requestAnimationFrame(() => centerPaintView(board));
+  }
+}
+
+function bindPaintToolbar(owner, ownerKind, workspace, board) {
+  $('paint-back-sheets').onclick = () => {
+    workspace.boardOpen = false;
+    V.paintSelection = null;
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+    rerenderPaintWorkspace(owner, ownerKind);
+  };
+  $('paint-new-sheet').onclick = () => createPaintBoardFlow(owner, ownerKind, workspace);
+  $('paint-add-block').onclick = () => addPaintBlockAtCenter(owner, ownerKind, workspace, board);
+  $('paint-add-photo').onclick = () => addPaintBoardMedia(owner, ownerKind, workspace, board);
+  $('paint-undo').onclick = () => undoPaintBoard(owner, ownerKind, workspace, board);
+  $('paint-delete-selected').onclick = () => deletePaintSelection(owner, ownerKind, workspace, board);
+  $('paint-board-title').oninput = e => {
+    board.title = e.target.value;
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+    renderPaintSheetTabs(owner, ownerKind, workspace, board);
+  };
+  if ($('paint-empty-block')) $('paint-empty-block').onclick = () => addPaintBlockAtCenter(owner, ownerKind, workspace, board);
+}
+
+function renderPaintSheetTabs(owner, ownerKind, workspace, activeBoard) {
+  const tabs = $('paint-sheet-tabs');
+  if (!tabs) return;
+  tabs.innerHTML = '';
+  const boards = workspace.boards.filter(board => sameId(board.categoryId, activeBoard.categoryId));
+  boards.forEach(board => {
+    const btn = document.createElement('button');
+    btn.className = 'chip-btn' + (sameId(board.id, activeBoard.id) ? ' active' : '');
+    btn.textContent = board.title;
+    btn.onclick = () => {
+      workspace.activeBoardId = board.id;
+      workspace.activeCategoryId = board.categoryId;
+      V.paintSelection = null;
+      touchPaintWorkspace(owner, ownerKind, workspace, board);
+      rerenderPaintWorkspace(owner, ownerKind);
+    };
+    tabs.appendChild(btn);
+  });
+}
+
+function applyPaintTransform(canvas, board) {
+  if (!canvas || !board) return;
+  canvas.style.transform = `translate(${board.panX || 0}px, ${board.panY || 0}px) scale(${board.zoom || 1})`;
+  const label = $('paint-zoom-label');
+  if (label) label.textContent = Math.round((board.zoom || 1) * 100) + '%';
+}
+
+function centerPaintView(board) {
+  const viewport = $('paint-viewport');
+  const canvas = $('paint-canvas');
+  if (!viewport || !canvas || !board) return;
+  const bounds = paintBoundsForElements(board.elements || [], board);
+  const zoom = board.zoom || 1;
+  if (!bounds) {
+    board.panX = viewport.clientWidth / 2;
+    board.panY = viewport.clientHeight / 2;
+  } else {
+    board.panX = viewport.clientWidth / 2 - (bounds.x + bounds.w / 2) * zoom;
+    board.panY = viewport.clientHeight / 2 - (bounds.y + bounds.h / 2) * zoom;
+  }
+  applyPaintTransform(canvas, board);
+}
+
+function renderPaintElements(owner, ownerKind, workspace, board) {
+  const canvas = $('paint-canvas');
+  if (!canvas) return;
+  canvas.innerHTML = '';
+  (board.elements || [])
+    .map(ensurePaintElementShape)
+    .filter(Boolean)
+    .sort((a, b) => paintVisualZ(a) - paintVisualZ(b))
+    .forEach(element => {
+      const node = createPaintElementNode(element, board, owner, ownerKind, workspace, false);
+      if (node) canvas.appendChild(node);
+    });
+}
+
+function createPaintElementNode(element, board, owner, ownerKind, workspace, preview = false) {
+  const bounds = paintElementBounds(element, board);
+  if (!bounds) return null;
+  const el = document.createElement('div');
+  el.className = 'paint-element'
+    + (preview ? ' paint-preview' : '')
+    + (V.paintSelection === element.id ? ' selected' : '')
+    + (V.paintConnectorFrom === element.id ? ' connector-source' : '');
+  el.dataset.paintElement = element.id;
+  el.style.left = `${Math.round(bounds.x)}px`;
+  el.style.top = `${Math.round(bounds.y)}px`;
+  el.style.width = `${Math.max(1, Math.round(bounds.w))}px`;
+  el.style.height = `${Math.max(1, Math.round(bounds.h))}px`;
+  el.style.zIndex = String(paintVisualZ(element));
+
+  if (element.type === 'path') {
+    const d = paintPathD(element.points, bounds);
+    el.classList.add('paint-path-element');
+    el.innerHTML = `<svg viewBox="0 0 ${Math.max(1, bounds.w)} ${Math.max(1, bounds.h)}" preserveAspectRatio="none">
+      <path d="${esc(d)}" fill="none" stroke="${esc(element.color)}" stroke-width="${esc(element.width)}" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>`;
+  } else if (element.type === 'line' || element.type === 'arrow') {
+    const line = paintLineSvg(element, bounds);
+    el.classList.add('paint-line-element');
+    el.innerHTML = line;
+  } else if (element.type === 'connector') {
+    el.classList.add('paint-connector-element');
+    el.innerHTML = paintConnectorSvg(element, bounds, board);
+  } else if (element.type === 'rect' || element.type === 'ellipse') {
+    el.classList.add('paint-shape-element', element.type === 'ellipse' ? 'paint-ellipse-element' : 'paint-rect-element');
+    el.style.borderColor = element.color;
+    el.style.borderWidth = `${Math.round(element.width)}px`;
+    el.style.background = element.fill === 'transparent' ? 'transparent' : element.fill;
+    if (element.type === 'ellipse') el.style.borderRadius = '50%';
+  } else if (element.type === 'text') {
+    el.classList.add('paint-text-element');
+    el.style.color = element.color;
+    el.style.fontSize = `${Math.round(element.fontSize || 28)}px`;
+    el.innerHTML = `<div class="paint-element-text">${esc(element.text || 'Text').replace(/\n/g, '<br>')}</div>`;
+  } else if (element.type === 'note') {
+    el.classList.add('paint-note-element');
+    el.style.borderColor = element.color;
+    el.style.background = element.fill === 'transparent' ? '#fff3a3' : element.fill;
+    el.style.fontSize = `${Math.round(element.fontSize || 18)}px`;
+    el.innerHTML = `<div class="paint-element-text">${esc(element.text || 'Note').replace(/\n/g, '<br>')}</div>`;
+  } else if (element.type === 'block') {
+    el.classList.add('paint-block-element');
+    el.style.borderColor = element.color;
+    el.style.background = element.fill === 'transparent' ? '#191d22' : element.fill;
+    el.style.fontSize = `${Math.round(element.fontSize || 14)}px`;
+    el.innerHTML = `<div class="paint-element-text">${esc(element.text || 'Block').replace(/\n/g, '<br>')}</div>`;
+  } else if (element.type === 'image') {
+    const media = getMediaById(element.mediaId);
+    el.classList.add('paint-image-element');
+    el.innerHTML = media ? mediaPreviewHTML(media, true) : '<span>Missing</span>';
+  }
+
+  if (!preview) {
+    if (['rect', 'ellipse', 'text', 'note', 'block', 'image'].includes(element.type)) {
+      const handle = document.createElement('span');
+      handle.className = 'paint-resize-handle';
+      handle.title = 'Resize';
+      el.appendChild(handle);
+    }
+    if (paintIsTileElement(element)) {
+      ['n', 'e', 's', 'w'].forEach(side => {
+        const dot = document.createElement('span');
+        dot.className = `paint-connect-dot ${side}`;
+        dot.dataset.side = side;
+        dot.title = 'Connect';
+        el.appendChild(dot);
+      });
+    }
+    if (V.paintSelection === element.id && paintIsTileElement(element)) {
+      const toolbar = document.createElement('div');
+      toolbar.className = 'paint-selection-toolbar';
+      toolbar.innerHTML = `
+        <button class="paint-selection-btn paint-delete-element" title="Delete">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 7h12M10 7V5h4v2M9 10v8M15 10v8M8 7l1 13h6l1-13"/></svg>
+        </button>`;
+      toolbar.querySelector('.paint-delete-element').onclick = event => {
+        event.stopPropagation();
+        deletePaintElement(owner, ownerKind, workspace, board, element.id);
+      };
+      el.appendChild(toolbar);
+    }
+    el.addEventListener('pointerdown', e => handlePaintElementPointerDown(e, owner, ownerKind, workspace, board, element, el));
+    if (paintElementHasInlineText(element)) {
+      el.addEventListener('dblclick', e => {
+        e.stopPropagation();
+        editPaintText(owner, ownerKind, workspace, board, element);
+      });
+    }
+    if (element.type === 'image') {
+      el.ondblclick = e => {
+        e.stopPropagation();
+        if (element.mediaId) openAlbumPhoto(element.mediaId);
+      };
+    }
+  }
+  return el;
+}
+
+function paintLineSvg(element, bounds) {
+  const x1 = element.x1 - bounds.x;
+  const y1 = element.y1 - bounds.y;
+  const x2 = element.x2 - bounds.x;
+  const y2 = element.y2 - bounds.y;
+  const markerId = `paint-arrow-${String(element.id).replace(/[^a-zA-Z0-9_-]/g, '')}`;
+  const marker = element.type === 'arrow'
+    ? `<defs><marker id="${esc(markerId)}" markerWidth="12" markerHeight="12" refX="10" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,8 L10,4 z" fill="${esc(element.color)}"></path></marker></defs>`
+    : '';
+  return `<svg viewBox="0 0 ${Math.max(1, bounds.w)} ${Math.max(1, bounds.h)}" preserveAspectRatio="none">
+    ${marker}
+    <line x1="${esc(x1)}" y1="${esc(y1)}" x2="${esc(x2)}" y2="${esc(y2)}" stroke="${esc(element.color)}" stroke-width="${esc(element.width)}" stroke-linecap="round" marker-end="${element.type === 'arrow' ? `url(#${esc(markerId)})` : ''}"></line>
+  </svg>`;
+}
+
+function paintConnectorSvg(element, bounds, board) {
+  const points = paintConnectorPoints(element, board);
+  const x1 = points.x1 - bounds.x;
+  const y1 = points.y1 - bounds.y;
+  const x2 = points.x2 - bounds.x;
+  const y2 = points.y2 - bounds.y;
+  const curve = Math.max(60, Math.min(240, Math.abs(x2 - x1) * .45));
+  const markerId = `paint-connector-${String(element.id).replace(/[^a-zA-Z0-9_-]/g, '')}`;
+  return `<svg viewBox="0 0 ${Math.max(1, bounds.w)} ${Math.max(1, bounds.h)}" preserveAspectRatio="none">
+    <defs><marker id="${esc(markerId)}" markerWidth="12" markerHeight="12" refX="10" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0,0 L0,8 L10,4 z" fill="${esc(element.color)}"></path></marker></defs>
+    <path d="M ${esc(x1)} ${esc(y1)} C ${esc(x1 + curve)} ${esc(y1)}, ${esc(x2 - curve)} ${esc(y2)}, ${esc(x2)} ${esc(y2)}" fill="none" stroke="${esc(element.color)}" stroke-width="${esc(element.width)}" stroke-linecap="round" marker-end="url(#${esc(markerId)})"></path>
+  </svg>`;
+}
+
+function paintPathD(points, bounds) {
+  return points.map((point, index) => {
+    const x = point.x - bounds.x;
+    const y = point.y - bounds.y;
+    return `${index ? 'L' : 'M'} ${roundPaintCoord(x)} ${roundPaintCoord(y)}`;
+  }).join(' ');
+}
+
+function roundPaintCoord(value) {
+  return Math.round(Number(value || 0) * 10) / 10;
+}
+
+function paintElementBounds(element, board = null) {
+  if (!element) return null;
+  if (element.type === 'path') return paintPointsBounds(element.points || [], element.width || 4);
+  if (element.type === 'line' || element.type === 'arrow' || element.type === 'connector') {
+    const points = element.type === 'connector' ? paintConnectorPoints(element, board) : element;
+    const pad = Math.ceil((element.width || 4) + 16);
+    const left = Math.min(points.x1, points.x2) - pad;
+    const top = Math.min(points.y1, points.y2) - pad;
+    const right = Math.max(points.x1, points.x2) + pad;
+    const bottom = Math.max(points.y1, points.y2) + pad;
+    return { x: left, y: top, w: Math.max(1, right - left), h: Math.max(1, bottom - top) };
+  }
+  if (['rect', 'ellipse', 'image', 'text', 'note', 'block'].includes(element.type)) {
+    return {
+      x: Number(element.x || 0),
+      y: Number(element.y || 0),
+      w: Math.max(1, Number(element.w || 1)),
+      h: Math.max(1, Number(element.h || 1)),
+    };
+  }
+  return null;
+}
+
+function paintConnectorPoints(element, board = null) {
+  const from = board?.elements?.find(item => sameId(item.id, element.fromId));
+  const to = board?.elements?.find(item => sameId(item.id, element.toId));
+  const fromCenter = paintAnchorForElement(from, element.fromSide || 's');
+  const toCenter = paintAnchorForElement(to, element.toSide || 'n');
+  return {
+    x1: from ? fromCenter.x : paintNumber(element.x1, 0),
+    y1: from ? fromCenter.y : paintNumber(element.y1, 0),
+    x2: to ? toCenter.x : paintNumber(element.x2, 0),
+    y2: to ? toCenter.y : paintNumber(element.y2, 0),
+  };
+}
+
+function paintPointsBounds(points, width = 4) {
+  if (!points?.length) return null;
+  const pad = Math.ceil(width + 8);
+  const xs = points.map(point => point.x);
+  const ys = points.map(point => point.y);
+  const left = Math.min(...xs) - pad;
+  const top = Math.min(...ys) - pad;
+  const right = Math.max(...xs) + pad;
+  const bottom = Math.max(...ys) + pad;
+  return { x: left, y: top, w: Math.max(1, right - left), h: Math.max(1, bottom - top) };
+}
+
+function paintBoundsForElements(elements, board = null) {
+  const bounds = (elements || []).map(element => paintElementBounds(element, board)).filter(Boolean);
+  if (!bounds.length) return null;
+  const left = Math.min(...bounds.map(rect => rect.x));
+  const top = Math.min(...bounds.map(rect => rect.y));
+  const right = Math.max(...bounds.map(rect => rect.x + rect.w));
+  const bottom = Math.max(...bounds.map(rect => rect.y + rect.h));
+  return { x: left, y: top, w: right - left, h: bottom - top };
+}
+
+function handlePaintElementPointerDown(e, owner, ownerKind, workspace, board, element, el) {
+  if (e.button !== 0) return;
+  if (e.target.closest('.paint-element-text.editing, .paint-element-text[contenteditable="true"]')) {
+    e.stopPropagation();
+    return;
+  }
+  if (e.detail > 1 && paintElementHasInlineText(element)) {
+    e.preventDefault();
+    e.stopPropagation();
+    editPaintText(owner, ownerKind, workspace, board, element);
+    return;
+  }
+  const dot = e.target.closest('.paint-connect-dot');
+  if (dot) {
+    startPaintConnectorDrag(e, owner, ownerKind, workspace, board, element, dot.dataset.side || 's');
+    return;
+  }
+  e.preventDefault();
+  e.stopPropagation();
+  V.paintSelection = element.id;
+  if (e.target.closest('.paint-resize-handle')) {
+    startPaintElementResize(e, owner, ownerKind, workspace, board, element, el);
+  } else {
+    startPaintElementMove(e, owner, ownerKind, workspace, board, element, el);
+  }
+}
+
+function startPaintElementMove(e, owner, ownerKind, workspace, board, element, el) {
+  pushPaintUndo(board);
+  bringPaintElementForward(board, element);
+  el.classList.add('moving', 'selected');
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const zoom = board.zoom || 1;
+  const snap = paintElementSnapshot(element);
+  const onMove = mv => {
+    const dx = (mv.clientX - startX) / zoom;
+    const dy = (mv.clientY - startY) / zoom;
+    applyPaintElementMove(element, snap, dx, dy);
+    const bounds = paintElementBounds(element, board);
+    if (bounds) {
+      el.style.left = `${Math.round(bounds.x)}px`;
+      el.style.top = `${Math.round(bounds.y)}px`;
+      el.style.width = `${Math.max(1, Math.round(bounds.w))}px`;
+      el.style.height = `${Math.max(1, Math.round(bounds.h))}px`;
+    }
+    element.updatedAt = now();
+    syncPaintConnectorNodes(board);
+  };
+  const onUp = () => {
+    el.classList.remove('moving');
+    document.removeEventListener('pointermove', onMove, true);
+    document.removeEventListener('pointerup', onUp, true);
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+    renderPaintElements(owner, ownerKind, workspace, board);
+  };
+  document.addEventListener('pointermove', onMove, true);
+  document.addEventListener('pointerup', onUp, true);
+}
+
+function startPaintElementResize(e, owner, ownerKind, workspace, board, element, el) {
+  if (!['rect', 'ellipse', 'image', 'text', 'note', 'block'].includes(element.type)) return;
+  pushPaintUndo(board);
+  e.preventDefault();
+  e.stopPropagation();
+  el.classList.add('resizing', 'selected');
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const zoom = board.zoom || 1;
+  const start = { w: element.w, h: element.h };
+  const onMove = mv => {
+    const dx = (mv.clientX - startX) / zoom;
+    const dy = (mv.clientY - startY) / zoom;
+    element.w = Math.max(PAINT_GRID_SIZE, paintSnap(start.w + dx));
+    element.h = Math.max(PAINT_GRID_SIZE, paintSnap(start.h + dy));
+    el.style.width = `${Math.round(element.w)}px`;
+    el.style.height = `${Math.round(element.h)}px`;
+    element.updatedAt = now();
+    syncPaintConnectorNodes(board);
+  };
+  const onUp = () => {
+    el.classList.remove('resizing');
+    document.removeEventListener('pointermove', onMove, true);
+    document.removeEventListener('pointerup', onUp, true);
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+  };
+  document.addEventListener('pointermove', onMove, true);
+  document.addEventListener('pointerup', onUp, true);
+}
+
+function paintElementSnapshot(element) {
+  return JSON.parse(JSON.stringify(element));
+}
+
+function syncPaintConnectorNodes(board) {
+  (board?.elements || []).forEach(element => {
+    if (element.type !== 'connector') return;
+    const points = paintConnectorPoints(element, board);
+    element.x1 = points.x1;
+    element.y1 = points.y1;
+    element.x2 = points.x2;
+    element.y2 = points.y2;
+  });
+}
+
+function startPaintConnectorDrag(e, owner, ownerKind, workspace, board, fromElement, fromSide = 's') {
+  if (!paintIsTileElement(fromElement)) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const viewport = $('paint-viewport');
+  const canvas = $('paint-canvas');
+  if (!viewport || !canvas) return;
+  const start = paintAnchorForElement(fromElement, fromSide);
+  const preview = ensurePaintElementShape({
+    id: 'preview_connector',
+    type: 'connector',
+    x1: start.x,
+    y1: start.y,
+    x2: start.x,
+    y2: start.y,
+    color: board.color,
+    fill: 'transparent',
+    width: Math.max(2, board.lineWidth),
+    z: 1,
+    createdAt: now(),
+    updatedAt: now(),
+  });
+  V.paintConnectorFrom = fromElement.id;
+  V.paintSelection = fromElement.id;
+  updatePaintPreview(canvas, board, preview);
+
+  const onMove = mv => {
+    const point = paintWorldPoint(mv, viewport, board);
+    preview.x2 = point.x;
+    preview.y2 = point.y;
+    updatePaintPreview(canvas, board, preview);
+  };
+  const onUp = up => {
+    document.removeEventListener('pointermove', onMove, true);
+    document.removeEventListener('pointerup', onUp, true);
+    clearPaintPreview(canvas);
+    const dropTarget = document.elementFromPoint(up.clientX, up.clientY);
+    const targetDot = dropTarget?.closest?.('.paint-connect-dot');
+    const targetNode = targetDot?.closest?.('[data-paint-element]') || dropTarget?.closest?.('[data-paint-element]');
+    const target = targetNode
+      ? board.elements.find(item => sameId(item.id, targetNode.dataset.paintElement))
+      : null;
+    if (target && !sameId(target.id, fromElement.id) && paintIsTileElement(target)) {
+      const point = paintWorldPoint(up, viewport, board);
+      addPaintConnector(owner, ownerKind, workspace, board, fromElement, target, fromSide, targetDot?.dataset.side || paintNearestSide(target, point));
+    } else {
+      V.paintConnectorFrom = null;
+      renderPaintElements(owner, ownerKind, workspace, board);
+    }
+  };
+  document.addEventListener('pointermove', onMove, true);
+  document.addEventListener('pointerup', onUp, true);
+}
+
+function paintNearestSide(element, point) {
+  const x = Number(element.x || 0);
+  const y = Number(element.y || 0);
+  const w = Number(element.w || 0);
+  const h = Number(element.h || 0);
+  const distances = [
+    ['n', Math.abs(point.y - y)],
+    ['s', Math.abs(point.y - (y + h))],
+    ['w', Math.abs(point.x - x)],
+    ['e', Math.abs(point.x - (x + w))],
+  ];
+  distances.sort((a, b) => a[1] - b[1]);
+  return distances[0]?.[0] || 'n';
+}
+
+function addPaintConnector(owner, ownerKind, workspace, board, fromElement, toElement, fromSide = 's', toSide = 'n') {
+  pushPaintUndo(board);
+  const start = paintAnchorForElement(fromElement, fromSide);
+  const end = paintAnchorForElement(toElement, toSide);
+  const connector = ensurePaintElementShape({
+    id: 'pel_' + uid(),
+    type: 'connector',
+    fromId: fromElement.id,
+    toId: toElement.id,
+    fromSide,
+    toSide,
+    x1: start.x,
+    y1: start.y,
+    x2: end.x,
+    y2: end.y,
+    color: '#8d949e',
+    fill: 'transparent',
+    width: 2,
+    z: 1,
+    createdAt: now(),
+    updatedAt: now(),
+  });
+  if (connector) board.elements.push(connector);
+  V.paintConnectorFrom = null;
+  V.paintSelection = toElement.id;
+  touchPaintWorkspace(owner, ownerKind, workspace, board);
+  rerenderPaintWorkspace(owner, ownerKind);
+}
+
+function applyPaintElementMove(element, snap, dx, dy) {
+  if (snap.type === 'path') {
+    element.points = snap.points.map(point => ({ x: point.x + dx, y: point.y + dy }));
+  } else if (snap.type === 'line' || snap.type === 'arrow') {
+    element.x1 = paintSnap(snap.x1 + dx);
+    element.y1 = paintSnap(snap.y1 + dy);
+    element.x2 = paintSnap(snap.x2 + dx);
+    element.y2 = paintSnap(snap.y2 + dy);
+  } else if (snap.type === 'connector') {
+    element.x1 = paintSnap(snap.x1 + dx);
+    element.y1 = paintSnap(snap.y1 + dy);
+    element.x2 = paintSnap(snap.x2 + dx);
+    element.y2 = paintSnap(snap.y2 + dy);
+  } else {
+    element.x = paintSnap(snap.x + dx);
+    element.y = paintSnap(snap.y + dy);
+  }
+}
+
+function editPaintText(owner, ownerKind, workspace, board, element, options = {}) {
+  const node = getPaintElementNode(element.id);
+  const host = node?.querySelector('.paint-element-text');
+  if (!host) return;
+  const placeCaret = () => {
+    host.focus({ preventScroll: true });
+    const range = document.createRange();
+    range.selectNodeContents(host);
+    if (!options.selectAll) range.collapse(false);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+  if (host.classList.contains('editing')) {
+    placeCaret();
+    return;
+  }
+  const before = element.text || '';
+  if (options.pushUndo !== false) pushPaintUndo(board);
+  V.paintSelection = element.id;
+  node.classList.add('editing', 'selected');
+  host.setAttribute('contenteditable', 'true');
+  host.spellcheck = false;
+  host.classList.add('editing');
+  requestAnimationFrame(placeCaret);
+  let finished = false;
+  const finish = save => {
+    if (finished) return;
+    finished = true;
+    host.setAttribute('contenteditable', 'false');
+    host.classList.remove('editing');
+    node.classList.remove('editing');
+    host.removeEventListener('blur', onBlur);
+    host.removeEventListener('keydown', onKeyDown);
+    host.removeEventListener('pointerdown', onPointerDown, true);
+    element.text = save ? host.innerText.trim() || (element.type === 'block' ? 'Block' : element.type === 'note' ? 'Note' : 'Text') : before;
+    element.updatedAt = now();
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+    rerenderPaintWorkspace(owner, ownerKind);
+  };
+  const onBlur = () => finish(true);
+  const onPointerDown = e => e.stopPropagation();
+  const onKeyDown = e => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      finish(false);
+    }
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault();
+      finish(true);
+    }
+  };
+  host.addEventListener('blur', onBlur);
+  host.addEventListener('keydown', onKeyDown);
+  host.addEventListener('pointerdown', onPointerDown, true);
+}
+
+function getPaintElementNode(elementId) {
+  return Array.from(document.querySelectorAll('[data-paint-element]'))
+    .find(node => sameId(node.dataset.paintElement, elementId)) || null;
+}
+
+function bindPaintViewport(owner, ownerKind, workspace, board, viewport, canvas) {
+  if (!viewport || !canvas || !board) return;
+  viewport.addEventListener('contextmenu', e => e.preventDefault());
+  viewport.addEventListener('dblclick', e => {
+    const node = e.target.closest?.('[data-paint-element]');
+    if (!node) return;
+    const element = (board.elements || []).find(item => sameId(item.id, node.dataset.paintElement));
+    if (!paintElementHasInlineText(element)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    V.paintSelection = element.id;
+    editPaintText(owner, ownerKind, workspace, board, element);
+  }, true);
+
+  viewport.addEventListener('wheel', e => {
+    e.preventDefault();
+    const zoom = board.zoom || 1;
+    if (e.shiftKey && !e.ctrlKey) {
+      board.panX = (board.panX || 0) - e.deltaY * 0.8;
+    } else {
+      const factor = Math.pow(1.0015, -e.deltaY);
+      const nextZoom = clampNumber(zoom * factor, zoom, 0.05, 20);
+      if (Math.abs(nextZoom - zoom) < 0.0001) return;
+      const rect = viewport.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+      board.panX = mx - (mx - (board.panX || 0)) * (nextZoom / zoom);
+      board.panY = my - (my - (board.panY || 0)) * (nextZoom / zoom);
+      board.zoom = nextZoom;
+    }
+    board.updatedAt = now();
+    workspace.updatedAt = now();
+    applyPaintTransform(canvas, board);
+    touchPaintOwner(owner, ownerKind);
+    markDirty();
+  }, { passive: false });
+
+  V._paintPanMode = false;
+  let panning = false;
+  let panStartX = 0;
+  let panStartY = 0;
+  let panStartPX = 0;
+  let panStartPY = 0;
+
+  const onKeyDown = e => {
+    if (e.code === 'Space' && !['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) {
+      e.preventDefault();
+      V._paintPanMode = true;
+      viewport.classList.add('pan-mode');
+    }
+  };
+  const onKeyUp = e => {
+    if (e.code === 'Space') {
+      V._paintPanMode = false;
+      if (!panning) viewport.classList.remove('pan-mode');
+    }
+  };
+  document.addEventListener('keydown', onKeyDown);
+  document.addEventListener('keyup', onKeyUp);
+  V.paintCleanup = () => {
+    document.removeEventListener('keydown', onKeyDown);
+    document.removeEventListener('keyup', onKeyUp);
+  };
+
+  const startPan = e => {
+    panning = true;
+    panStartX = e.clientX;
+    panStartY = e.clientY;
+    panStartPX = board.panX || 0;
+    panStartPY = board.panY || 0;
+    viewport.classList.add('panning');
+    try { viewport.setPointerCapture(e.pointerId); } catch (_) {}
+    e.preventDefault();
+    e.stopPropagation();
+  };
+
+  viewport.addEventListener('pointerdown', e => {
+    if (e.target.closest('.paint-element, .paint-empty-box')) return;
+    if (e.button === 2 || e.button === 1 || (e.button === 0 && V._paintPanMode)) {
+      startPan(e);
+      return;
+    }
+    if (e.button !== 0) return;
+    V.paintSelection = null;
+    V.paintConnectorFrom = null;
+    renderPaintElements(owner, ownerKind, workspace, board);
+  });
+
+  viewport.addEventListener('pointermove', e => {
+    if (!panning) return;
+    board.panX = panStartPX + (e.clientX - panStartX);
+    board.panY = panStartPY + (e.clientY - panStartY);
+    applyPaintTransform(canvas, board);
+  });
+  const stopPan = e => {
+    if (!panning) return;
+    panning = false;
+    viewport.classList.remove('panning');
+    if (!V._paintPanMode) viewport.classList.remove('pan-mode');
+    try { viewport.releasePointerCapture(e.pointerId); } catch (_) {}
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+  };
+  viewport.addEventListener('pointerup', stopPan);
+  viewport.addEventListener('pointercancel', stopPan);
+}
+
+function paintWorldPoint(e, viewport = $('paint-viewport'), board = getActivePaintContext()?.board) {
+  if (!viewport || !board) return { x: 0, y: 0 };
+  const rect = viewport.getBoundingClientRect();
+  return {
+    x: (e.clientX - rect.left - (board.panX || 0)) / (board.zoom || 1),
+    y: (e.clientY - rect.top - (board.panY || 0)) / (board.zoom || 1),
+  };
+}
+
+function startPaintDraw(e, owner, ownerKind, workspace, board, viewport, canvas) {
+  e.preventDefault();
+  e.stopPropagation();
+  pushPaintUndo(board);
+  const start = paintWorldPoint(e, viewport, board);
+  const tool = board.tool;
+  let points = [start];
+  let preview = createPaintDraftElement(board, tool, start, start, points);
+  updatePaintPreview(canvas, board, preview);
+
+  const onMove = mv => {
+    const point = paintWorldPoint(mv, viewport, board);
+    if (['pencil', 'brush', 'eraser'].includes(tool)) {
+      const last = points[points.length - 1];
+      if (Math.hypot(point.x - last.x, point.y - last.y) > 1) points.push(point);
+      preview = createPaintDraftElement(board, tool, start, point, points);
+    } else {
+      preview = createPaintDraftElement(board, tool, start, point, points);
+    }
+    updatePaintPreview(canvas, board, preview);
+  };
+  const onUp = up => {
+    document.removeEventListener('pointermove', onMove, true);
+    document.removeEventListener('pointerup', onUp, true);
+    clearPaintPreview(canvas);
+    const end = paintWorldPoint(up, viewport, board);
+    const element = ensurePaintElementShape(createPaintDraftElement(board, tool, start, end, points));
+    if (element && paintElementHasSize(element)) {
+      element.z = paintNextZ(board);
+      board.elements.push(element);
+      V.paintSelection = element.id;
+      touchPaintWorkspace(owner, ownerKind, workspace, board);
+      rerenderPaintWorkspace(owner, ownerKind);
+    }
+  };
+  document.addEventListener('pointermove', onMove, true);
+  document.addEventListener('pointerup', onUp, true);
+}
+
+function createPaintDraftElement(board, tool, start, end, points) {
+  const base = {
+    id: 'pel_' + uid(),
+    color: tool === 'eraser' ? board.background || PAINT_BACKGROUND : board.color,
+    fill: board.fillShapes ? board.fillColor : 'transparent',
+    width: tool === 'brush' ? Math.max(6, board.lineWidth * 2) : tool === 'eraser' ? Math.max(14, board.lineWidth * 3) : board.lineWidth,
+    createdAt: now(),
+    updatedAt: now(),
+  };
+  if (['pencil', 'brush', 'eraser'].includes(tool)) {
+    return { ...base, type: 'path', tool, points: [...points] };
+  }
+  if (tool === 'line' || tool === 'arrow') {
+    return { ...base, type: tool, x1: start.x, y1: start.y, x2: end.x, y2: end.y };
+  }
+  const rect = normalizePaintDrawRect(start, end);
+  return { ...base, type: tool, x: rect.x, y: rect.y, w: rect.w, h: rect.h };
+}
+
+function normalizePaintDrawRect(a, b) {
+  const start = paintSnapPoint(a);
+  const end = paintSnapPoint(b);
+  return {
+    x: Math.min(start.x, end.x),
+    y: Math.min(start.y, end.y),
+    w: Math.abs(start.x - end.x),
+    h: Math.abs(start.y - end.y),
+  };
+}
+
+function paintElementHasSize(element) {
+  if (element.type === 'path') return (element.points || []).length > 1;
+  if (element.type === 'line' || element.type === 'arrow' || element.type === 'connector') return Math.hypot(element.x2 - element.x1, element.y2 - element.y1) > 3;
+  return Number(element.w || 0) > 4 && Number(element.h || 0) > 4;
+}
+
+function updatePaintPreview(canvas, board, element) {
+  clearPaintPreview(canvas);
+  const node = createPaintElementNode(element, board, null, null, null, true);
+  if (node) canvas.appendChild(node);
+}
+
+function clearPaintPreview(canvas = $('paint-canvas')) {
+  if (!canvas) return;
+  canvas.querySelectorAll('.paint-preview').forEach(node => node.remove());
+}
+
+function addPaintBlockAtCenter(owner, ownerKind, workspace, board) {
+  const center = paintViewportCenter(board);
+  const w = 280;
+  const h = 160;
+  const point = { x: center.x - w / 2, y: center.y - h / 2 };
+  addPaintTextElement(owner, ownerKind, workspace, board, point, 'block', { autoEdit: true });
+}
+
+function addPaintTextElement(owner, ownerKind, workspace, board, point, type, options = {}) {
+  const snapped = paintSnapPoint(point);
+  pushPaintUndo(board);
+  const element = ensurePaintElementShape({
+    id: 'pel_' + uid(),
+    type,
+    x: snapped.x,
+    y: snapped.y,
+    w: type === 'block' ? 280 : type === 'note' ? 280 : 320,
+    h: type === 'block' ? 160 : type === 'note' ? 170 : Math.max(PAINT_GRID_SIZE, board.fontSize * 2.1),
+    text: type === 'block' ? 'Block' : type === 'note' ? 'Note' : 'Text',
+    color: type === 'block' ? '#5d6674' : board.color,
+    fill: type === 'block' ? '#181b20' : type === 'text' ? 'transparent' : type === 'note' ? '#272421' : board.fillColor,
+    width: Math.max(1, board.lineWidth),
+    fontSize: type === 'block' ? 14 : type === 'note' ? 18 : board.fontSize,
+    z: paintNextZ(board),
+    createdAt: now(),
+    updatedAt: now(),
+  });
+  if (element) {
+    board.elements.push(element);
+    V.paintSelection = element.id;
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+    rerenderPaintWorkspace(owner, ownerKind);
+    if (options.autoEdit) {
+      requestAnimationFrame(() => editPaintText(owner, ownerKind, workspace, board, element, { pushUndo: false, selectAll: true }));
+    }
+  }
+}
+
+function deletePaintSelection(owner, ownerKind, workspace, board) {
+  if (!V.paintSelection) {
+    toast('Select a block or photo first');
+    return;
+  }
+  deletePaintElement(owner, ownerKind, workspace, board, V.paintSelection);
+}
+
+function deletePaintElement(owner, ownerKind, workspace, board, elementId) {
+  const target = (board.elements || []).find(element => sameId(element.id, elementId));
+  if (!target) return;
+  pushPaintUndo(board);
+  const mediaId = target.type === 'image' ? target.mediaId : null;
+  board.elements = (board.elements || []).filter(element =>
+    !sameId(element.id, elementId) &&
+    !sameId(element.fromId, elementId) &&
+    !sameId(element.toId, elementId)
+  );
+  if (mediaId) S.media = S.media.filter(media => !sameId(media.id, mediaId));
+  V.paintSelection = null;
+  V.paintConnectorFrom = null;
+  touchPaintWorkspace(owner, ownerKind, workspace, board);
+  rerenderPaintWorkspace(owner, ownerKind);
+}
+
+function paintNextZ(board) {
+  return Math.max(1, ...(board.elements || []).map(element => Number(element.z || 1))) + 1;
+}
+
+function bringPaintElementForward(board, element) {
+  element.z = paintNextZ(board);
+}
+
+function pushPaintUndo(board) {
+  if (!board) return;
+  if (!V.paintHistory) V.paintHistory = {};
+  const key = board.id;
+  V.paintHistory[key] ??= [];
+  V.paintHistory[key].push(JSON.stringify({
+    background: board.background || PAINT_BACKGROUND,
+    elements: (board.elements || []).map(element => ({ ...element })),
+  }));
+  if (V.paintHistory[key].length > 80) V.paintHistory[key].shift();
+}
+
+function undoPaintBoard(owner, ownerKind, workspace, board) {
+  const history = V.paintHistory?.[board.id] || [];
+  const snap = history.pop();
+  if (!snap) {
+    toast('Nothing to undo');
+    return;
+  }
+  try {
+    const data = JSON.parse(snap);
+    board.background = paintColor(data.background, board.background || PAINT_BACKGROUND);
+    board.elements = Array.isArray(data.elements) ? data.elements.map(ensurePaintElementShape).filter(Boolean) : [];
+    V.paintSelection = null;
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+    rerenderPaintWorkspace(owner, ownerKind);
+  } catch (e) {
+    toast('Could not undo');
+  }
+}
+
+function clearPaintBoard(owner, ownerKind, workspace, board) {
+  if (!board?.elements?.length) return;
+  if (!confirm(`Clear sheet "${board.title}"?`)) return;
+  pushPaintUndo(board);
+  const mediaIds = new Set(board.elements.filter(element => element.type === 'image').map(element => element.mediaId).filter(Boolean));
+  board.elements = [];
+  S.media = S.media.filter(media => !mediaIds.has(media.id));
+  V.paintSelection = null;
+  touchPaintWorkspace(owner, ownerKind, workspace, board);
+  rerenderPaintWorkspace(owner, ownerKind);
+}
+
+function deletePaintBoard(owner, ownerKind, workspace, board) {
+  if (workspace.boards.length <= 1) {
+    toast('Keep one sheet');
+    return;
+  }
+  if (!confirm(`Delete sheet "${board.title}"?`)) return;
+  const mediaIds = new Set((board.elements || []).filter(element => element.type === 'image').map(element => element.mediaId).filter(Boolean));
+  S.media = S.media.filter(media => !mediaIds.has(media.id));
+  workspace.boards = workspace.boards.filter(item => !sameId(item.id, board.id));
+  workspace.activeBoardId = workspace.boards.find(item => sameId(item.categoryId, workspace.activeCategoryId))?.id || workspace.boards[0]?.id || null;
+  workspace.boardOpen = false;
+  V.paintSelection = null;
+  touchPaintWorkspace(owner, ownerKind, workspace);
+  rerenderPaintWorkspace(owner, ownerKind);
+}
+
+async function addPaintBoardMedia(owner, ownerKind, workspace, board, point = null) {
+  const files = await pickMediaFiles('photo');
+  addPaintBoardFiles(files, owner, ownerKind, workspace, board, point);
+}
+
+function addPaintBoardFiles(files, owner, ownerKind, workspace, board, point = null) {
+  const valid = (files || []).filter(fp => kindAllowsFile('photo', fp));
+  if (!valid.length) return;
+  const center = point || paintViewportCenter(board);
+  pushPaintUndo(board);
+  let lastId = null;
+  valid.forEach((fp, index) => {
+    const media = registerMediaFile(fp, owner.id, 'photo', 'paint');
+    if (!media) return;
+    const element = ensurePaintElementShape({
+      id: 'pel_' + uid(),
+      type: 'image',
+      mediaId: media.id,
+      x: paintSnap(center.x - 180 + index * 40),
+      y: paintSnap(center.y - 120 + index * 40),
+      w: 360,
+      h: 240,
+      color: '#5d6674',
+      fill: 'transparent',
+      width: 1,
+      z: paintNextZ(board),
+      createdAt: now(),
+      updatedAt: now(),
+    });
+    if (element) {
+      board.elements.push(element);
+      lastId = element.id;
+    }
+  });
+  if (lastId) V.paintSelection = lastId;
+  touchPaintWorkspace(owner, ownerKind, workspace, board);
+  rerenderPaintWorkspace(owner, ownerKind);
+  toast(`Added: ${valid.length}`);
+}
+
+function paintViewportCenter(board) {
+  const viewport = $('paint-viewport');
+  if (!viewport || !board) return { x: 0, y: 0 };
+  return {
+    x: (viewport.clientWidth / 2 - (board.panX || 0)) / (board.zoom || 1),
+    y: (viewport.clientHeight / 2 - (board.panY || 0)) / (board.zoom || 1),
+  };
+}
+
+function bindPaintDrop(owner, ownerKind, workspace, board, viewport) {
+  if (!viewport) return;
+  viewport.addEventListener('dragover', e => {
+    if (dropHasFiles(e.dataTransfer)) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+      viewport.classList.add('drag-over');
+    }
+  });
+  viewport.addEventListener('dragleave', e => {
+    if (!viewport.contains(e.relatedTarget)) viewport.classList.remove('drag-over');
+  });
+  viewport.addEventListener('drop', e => {
+    if (!dropHasFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    viewport.classList.remove('drag-over');
+    const files = filePathsFromDrop(e.dataTransfer);
+    if (!files.length) {
+      toast('Could not read dropped files');
+      return;
+    }
+    addPaintBoardFiles(files, owner, ownerKind, workspace, board, paintWorldPoint(e, viewport, board));
+  });
+}
+
+function removePaintMediaRefs(workspace, mediaId) {
+  if (!workspace?.boards) return;
+  workspace.boards.forEach(board => {
+    board.elements = (board.elements || []).filter(element => !(element.type === 'image' && sameId(element.mediaId, mediaId)));
+    board.updatedAt = now();
+  });
+  workspace.updatedAt = now();
+}
+
+function getActivePaintContext() {
+  if (S.view === 'projects' && S.activeProjectTab === 'board') {
+    const owner = getActiveProject();
+    if (!owner) return null;
+    const workspace = getPaintWorkspaceForOwner(owner);
+    if (!workspace.boardOpen) return null;
+    return { owner, ownerKind: 'project', workspace, board: getActivePaintBoard(workspace) };
+  }
+  if (S.view === 'game' && S.activeTab === 'board') {
+    const owner = getActiveGame();
+    if (!owner) return null;
+    const workspace = getPaintWorkspaceForOwner(owner);
+    if (!workspace.boardOpen) return null;
+    return { owner, ownerKind: 'game', workspace, board: getActivePaintBoard(workspace) };
+  }
+  return null;
+}
+
 function renderProjectKanban(project) {
   const content = $('project-tab-content');
   let milestone = getActiveMilestone(project);
@@ -6019,7 +7685,7 @@ function renderKanbanBoard(project, milestone, board) {
   const columns = $('kanban-columns');
   KANBAN_COLUMNS.forEach(([key, label]) => {
     const col = document.createElement('section');
-    col.className = 'kanban-column';
+    col.className = 'kanban-column' + (key === 'done' ? ' kanban-column-done' : '');
     const tasks = board.columns[key] || [];
     col.innerHTML = `
       <div class="kanban-column-head">
@@ -6063,7 +7729,8 @@ function renderKanbanBoard(project, milestone, board) {
 function buildTaskCard(project, milestone, board, columnKey, task) {
   ensureTaskShape(task);
   const card = document.createElement('div');
-  card.className = `task-card task-importance-${esc(importanceLevel(task.importance).id)}`;
+  const isDone = columnKey === 'done';
+  card.className = `task-card task-importance-${esc(importanceLevel(task.importance).id)}${isDone ? ' task-done' : ''}`;
   let dragging = false;
   card.draggable = true;
   card.addEventListener('dragstart', e => {
@@ -6081,6 +7748,7 @@ function buildTaskCard(project, milestone, board, columnKey, task) {
     setTimeout(() => { dragging = false; }, 0);
   });
   const meta = [
+    isDone ? `Done${task.completedAt ? ` ${formatShortDate(task.completedAt)}` : ''}` : '',
     (task.notes || '').trim().slice(0, 96),
     (task.mediaIds || []).length ? `${(task.mediaIds || []).length} media` : '',
   ].filter(Boolean).join(' - ');
@@ -6089,6 +7757,7 @@ function buildTaskCard(project, milestone, board, columnKey, task) {
     <div class="task-card-top">
       ${importanceBadgeHTML(task.importance)}
       <span class="task-title-btn">${esc(task.title || 'Untitled')}</span>
+      ${isDone ? '<span class="task-done-mark">Done</span>' : ''}
       <button class="task-to-today-btn${alreadyInDaily ? ' added' : ''}" data-task-id="${esc(task.id)}" title="Add to Today's extras" ${alreadyInDaily ? 'disabled' : ''}>${alreadyInDaily ? '✓' : '+Today'}</button>
     </div>
     ${meta ? `<div class="task-card-meta">${esc(meta)}</div>` : ''}`;
@@ -6290,6 +7959,7 @@ function renderGameWorkspace() {
 
   const tabs = [
     ['notes', 'Notes'],
+    ['board', 'Board'],
     ['photos', 'Images'],
     ['videos', 'Video'],
     ['sound', 'Audio'],
@@ -6341,6 +8011,7 @@ function renderGameWorkspace() {
   });
 
   if (S.activeTab === 'notes') renderNotesTab(game);
+  else if (S.activeTab === 'board') renderGamePaintBoard(game);
   else if (S.activeTab === 'photos') renderGameMediaGridTab(game, 'photo');
   else if (S.activeTab === 'videos') renderGameMediaGridTab(game, 'video');
   else if (S.activeTab === 'sound') renderMediaTab(game, 'sound');
@@ -7035,6 +8706,9 @@ function registerMediaFile(fp, gameId, kind, scope = 'game') {
   const game = S.games.find(item => item.id === gameId);
   const project = S.projects.find(item => item.id === gameId);
   const drawing = S.drawing?.id === gameId ? ensureDrawingShape(S.drawing) : null;
+  const paintWorkspace = scope === 'paint' && (game || project)
+    ? getPaintWorkspaceForOwner(game || project)
+    : null;
   const projectMediaOrder = S.media.filter(item => item.gameId === gameId && item.scope === scope && item.kind === kind).length;
   const item = {
     id,
@@ -7055,7 +8729,9 @@ function registerMediaFile(fp, gameId, kind, scope = 'game') {
         ? getActiveMediaCategory(project, kind).id
         : scope === 'drawing' && drawing
           ? getActiveMediaCategory(drawing, kind).id
-          : 'imgcat_default',
+          : scope === 'paint' && paintWorkspace
+            ? getActivePaintCategory(paintWorkspace).id
+            : 'imgcat_default',
     copied: false,
     createdAt: now(),
     updatedAt: now(),
@@ -7077,6 +8753,7 @@ function removeMedia(mediaId) {
     if (game.notes?.blocks) game.notes.blocks = game.notes.blocks.filter(block => block.mediaId !== mediaId);
     if (game.iconMediaId === mediaId) game.iconMediaId = null;
     if (game.coverMediaId === mediaId) game.coverMediaId = null;
+    removePaintMediaRefs(game.paintBoards, mediaId);
   });
   S.dailyNotes.forEach(note => {
     note.blocks = (note.blocks || []).filter(block => block.mediaId !== mediaId);
@@ -7100,6 +8777,7 @@ function removeMedia(mediaId) {
   S.projects.forEach(project => {
     if (project.doc?.blocks) project.doc.blocks = project.doc.blocks.filter(block => block.mediaId !== mediaId);
     if (project.notes?.blocks) project.notes.blocks = project.notes.blocks.filter(block => block.mediaId !== mediaId);
+    removePaintMediaRefs(project.paintBoards, mediaId);
     (project.milestones || []).forEach(milestone => {
       (milestone.boards || []).forEach(board => {
         Object.values(board.columns || {}).forEach(tasks => {
@@ -7112,9 +8790,17 @@ function removeMedia(mediaId) {
   });
   if (S.activeMediaId === mediaId) S.activeMediaId = null;
   stopViewer();
-  touchGame(media.gameId);
+  const mediaGame = S.games.find(game => sameId(game.id, media.gameId));
+  const mediaProject = S.projects.find(project => sameId(project.id, media.gameId));
+  if (mediaGame) touchGame(mediaGame.id);
+  if (mediaProject) touchProject(mediaProject);
   markDirty();
-  renderGameWorkspace();
+  if (S.view === 'projects') renderProjects();
+  else if (S.view === 'game') renderGameWorkspace();
+  else if (S.view === 'moodboard') renderMoodboard();
+  else if (S.view === 'drawing') renderDrawing();
+  else if (S.view === 'photo-boards') renderPhotoBoards();
+  else renderApp();
 }
 
 function inferMediaType(fp) {
@@ -7889,11 +9575,18 @@ function initControls() {
         renderMoodboard();
         return;
       }
+      const paintContext = getActivePaintContext();
+      if (paintContext && V.paintSelection) {
+        e.preventDefault();
+        V.paintSelection = null;
+        rerenderPaintWorkspace(paintContext.owner, paintContext.ownerKind);
+        return;
+      }
       e.preventDefault();
       goBack();
       return;
     }
-    if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
+    if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
     const k = e.key.toLowerCase();
     if ((e.ctrlKey || e.metaKey) && k === 'z' && S.view === 'moodboard') {
       e.preventDefault();
@@ -7905,6 +9598,21 @@ function initControls() {
       const board = getActiveMoodboard();
       setMoodboardSelection((board?.items || []).map(item => item.id), board);
       renderMoodboard();
+      return;
+    }
+    const paintContext = getActivePaintContext();
+    if ((e.ctrlKey || e.metaKey) && k === 'z' && paintContext) {
+      e.preventDefault();
+      undoPaintBoard(paintContext.owner, paintContext.ownerKind, paintContext.workspace, paintContext.board);
+      return;
+    }
+    if ((e.key === 'Delete' || e.key === 'Backspace') && paintContext && V.paintSelection) {
+      e.preventDefault();
+      deletePaintSelection(paintContext.owner, paintContext.ownerKind, paintContext.workspace, paintContext.board);
+      return;
+    }
+    if (paintContext && k === ' ') {
+      e.preventDefault();
       return;
     }
     if (k === ' ') {

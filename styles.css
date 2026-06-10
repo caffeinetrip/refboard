@@ -1966,6 +1966,11 @@ body {
   background: var(--panel-2);
 }
 
+.kanban-column-done {
+  border-color: rgba(127, 141, 163, .34);
+  background: linear-gradient(180deg, rgba(127, 141, 163, .12), rgba(20, 22, 25, .92));
+}
+
 .kanban-column.drag-over {
   border-color: var(--accent-2);
   background: var(--accent-soft);
@@ -2039,6 +2044,57 @@ body {
   border-radius: var(--radius);
   background: var(--panel-3);
   cursor: grab;
+}
+
+.task-card.task-done {
+  opacity: .62;
+  border-left-color: rgba(127, 141, 163, .72);
+  background: linear-gradient(90deg, rgba(127, 141, 163, .14), rgba(25, 29, 34, .72) 38%);
+  filter: saturate(.62);
+}
+
+.task-card.task-done:hover {
+  opacity: .86;
+  filter: saturate(.78);
+}
+
+.task-card.task-done .rarity-badge {
+  opacity: .58;
+}
+
+.task-card.task-done .task-title-btn {
+  color: var(--dim);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  text-decoration-color: rgba(215, 220, 227, .58);
+}
+
+.task-card.task-done .daily-task-title-input {
+  color: var(--dim);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  text-decoration-color: rgba(215, 220, 227, .58);
+}
+
+.task-card.task-done .task-card-meta {
+  color: rgba(141, 148, 158, .72);
+}
+
+.task-card.task-done .daily-task-notes {
+  color: rgba(141, 148, 158, .72);
+}
+
+.task-done-mark {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid rgba(127, 141, 163, .25);
+  border-radius: 3px;
+  color: var(--accent-2);
+  background: rgba(127, 141, 163, .12);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.5;
+  text-transform: uppercase;
 }
 
 .task-importance-noted {
@@ -2546,7 +2602,8 @@ body {
 }
 
 .daily-extra-card.done {
-  opacity: .82;
+  opacity: .62;
+  filter: saturate(.62);
 }
 
 .daily-extra-top {
@@ -2740,6 +2797,14 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
+}
+
+.daily-template-categories {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 14px;
+  overflow-x: auto;
 }
 
 .daily-template-card {
@@ -3272,6 +3337,424 @@ body {
   border-color: var(--accent-2);
   background: var(--accent-soft);
   color: var(--text);
+}
+
+.paint-board-library {
+  padding-bottom: 28px;
+}
+
+.paint-category-controls {
+  margin-bottom: 14px;
+}
+
+.paint-sheet-card .category-card-cover {
+  background: var(--bg);
+  background-image: radial-gradient(circle, rgba(161, 173, 188, .14) 1px, transparent 1.2px);
+  background-size: 14px 14px;
+}
+
+.paint-sheet-mark {
+  width: 52px;
+  height: 52px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  background: var(--panel-3);
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.paint-board-shell {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+.paint-board-shell .paint-toolbar {
+  gap: 6px;
+}
+
+.paint-toolbar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+
+.paint-toolbar-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.paint-title-wrap,
+.paint-actions,
+.paint-sheet-row,
+.paint-sheet-tabs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.paint-board-title {
+  width: min(320px, 38vw);
+  height: 34px;
+  background: var(--panel-2);
+}
+
+.paint-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.paint-sheet-tabs {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.paint-sheet-row {
+  justify-content: space-between;
+  padding-top: 2px;
+}
+
+.paint-sheet-add-btn {
+  flex: 0 0 auto;
+}
+
+.paint-viewport {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(circle, rgba(161, 173, 188, .14) 1px, transparent 1.2px);
+  background-size: 20px 20px;
+  cursor: crosshair;
+}
+
+.paint-viewport.pan-mode,
+.paint-viewport.panning {
+  cursor: grab;
+}
+
+.paint-viewport.panning {
+  cursor: grabbing;
+}
+
+.paint-viewport.drag-over {
+  box-shadow: inset 0 0 0 2px rgba(31, 35, 40, .38);
+}
+
+.paint-canvas {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  transform-origin: 0 0;
+  will-change: transform;
+}
+
+.paint-element {
+  position: absolute;
+  transform-origin: 0 0;
+  user-select: none;
+}
+
+.paint-element.editing {
+  cursor: text;
+}
+
+.paint-element.editing .paint-connect-dot,
+.paint-element.editing .paint-resize-handle,
+.paint-element.editing .paint-selection-toolbar {
+  display: none;
+}
+
+.paint-element.selected,
+.paint-element:hover {
+  overflow: visible;
+}
+
+.paint-element svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.paint-shape-element {
+  border-style: solid;
+  background: transparent;
+}
+
+.paint-text-element,
+.paint-note-element {
+  overflow: hidden;
+  line-height: 1.2;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.paint-text-element {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.paint-note-element {
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  color: var(--text);
+  background: var(--panel-3);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .2);
+}
+
+.paint-block-element {
+  border: 1px solid var(--line-2);
+  border-radius: 5px;
+  color: var(--text);
+  background: var(--panel-3);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, .22);
+  line-height: 1.35;
+}
+
+.paint-element-text {
+  width: 100%;
+  height: 100%;
+  padding: 10px;
+  outline: none;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.paint-block-element .paint-element-text {
+  color: var(--text);
+}
+
+.paint-element-text.editing {
+  user-select: text;
+  cursor: text;
+  background: rgba(127, 141, 163, .08);
+  overflow: auto;
+}
+
+.paint-image-element {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  border: 1px solid var(--line-2);
+  background: rgba(25, 29, 34, .74);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, .24);
+}
+
+.paint-image-element img,
+.paint-image-element video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  pointer-events: none;
+}
+
+.paint-element.selected {
+  outline: 1px solid rgba(161, 173, 188, .9);
+  outline-offset: 3px;
+}
+
+.paint-element.connector-source {
+  outline: 1px solid var(--accent-2);
+  outline-offset: 4px;
+}
+
+.paint-connector-element {
+  pointer-events: none;
+  opacity: .78;
+}
+
+.paint-connect-dot {
+  position: absolute;
+  z-index: 5;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--bg);
+  border-radius: 999px;
+  background: var(--accent-2);
+  box-shadow: 0 0 0 1px rgba(161, 173, 188, .42);
+  opacity: 0;
+  cursor: crosshair;
+  transition: opacity .1s ease, transform .1s ease;
+}
+
+.paint-connect-dot.n {
+  left: 50%;
+  top: -6px;
+  transform: translateX(-50%);
+}
+
+.paint-connect-dot.e {
+  right: -6px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.paint-connect-dot.s {
+  left: 50%;
+  bottom: -6px;
+  transform: translateX(-50%);
+}
+
+.paint-connect-dot.w {
+  left: -6px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.paint-element:hover .paint-connect-dot,
+.paint-element.selected .paint-connect-dot,
+.paint-element.connector-source .paint-connect-dot {
+  opacity: .95;
+}
+
+.paint-connect-dot:hover {
+  transform: scale(1.18);
+}
+
+.paint-connect-dot.n:hover,
+.paint-connect-dot.s:hover {
+  transform: translateX(-50%) scale(1.18);
+}
+
+.paint-connect-dot.e:hover,
+.paint-connect-dot.w:hover {
+  transform: translateY(-50%) scale(1.18);
+}
+
+.paint-selection-toolbar {
+  position: absolute;
+  left: 50%;
+  top: -48px;
+  z-index: 8;
+  display: flex;
+  gap: 6px;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: rgba(20, 22, 25, .94);
+  box-shadow: var(--shadow);
+  transform: translateX(-50%);
+}
+
+.paint-selection-btn {
+  width: 30px;
+  height: 30px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+}
+
+.paint-selection-btn:hover {
+  border-color: var(--line-2);
+  background: var(--hover);
+  color: var(--text);
+}
+
+.paint-selection-btn svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.paint-element.moving,
+.paint-element.resizing {
+  opacity: .86;
+}
+
+.paint-resize-handle {
+  position: absolute;
+  right: -8px;
+  bottom: -8px;
+  width: 14px;
+  height: 14px;
+  border: 1px solid rgba(17, 19, 21, .7);
+  border-radius: 3px;
+  background: #f7f8fa;
+  cursor: nwse-resize;
+  opacity: 0;
+}
+
+.paint-element:hover .paint-resize-handle,
+.paint-element.selected .paint-resize-handle {
+  opacity: 1;
+}
+
+.paint-preview {
+  opacity: .72;
+  pointer-events: none;
+}
+
+.paint-empty-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.paint-empty-box {
+  width: 160px;
+  height: 110px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1.5px dashed var(--line-2);
+  border-radius: 8px;
+  background: rgba(20, 22, 25, .82);
+  color: var(--text);
+  pointer-events: auto;
+}
+
+.paint-empty-box:hover {
+  border-color: var(--accent-2);
+  background: var(--panel-3);
+}
+
+.paint-empty-icon {
+  font-size: 30px;
+  line-height: 1;
+}
+
+.paint-empty-title {
+  font-size: 13px;
+  font-weight: 700;
 }
 
 #audio-viewer {
@@ -4152,6 +4635,23 @@ body {
   .game-fields,
   .form-grid {
     grid-template-columns: 1fr;
+  }
+
+  .paint-toolbar-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .paint-actions {
+    justify-content: flex-start;
+  }
+
+  .paint-board-title {
+    width: min(100%, 420px);
+  }
+
+  .paint-range-control input[type="range"] {
+    width: 70px;
   }
 
   .template-row {
