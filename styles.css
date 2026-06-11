@@ -3532,6 +3532,38 @@ body {
   background: var(--panel-3);
   box-shadow: 0 10px 28px rgba(0, 0, 0, .22);
   line-height: 1.35;
+  display: flex;
+  flex-direction: column;
+}
+
+.paint-element-title {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  font-weight: 700;
+  font-size: 1.05em;
+  border-bottom: 1px solid var(--line-2);
+  outline: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  color: var(--text);
+}
+
+.paint-element-title.editing {
+  user-select: text;
+  cursor: text;
+  background: rgba(127, 141, 163, .08);
+}
+
+.paint-title-placeholder {
+  color: var(--text-3, #8d949e);
+  font-weight: 400;
+  font-style: italic;
+}
+
+.paint-block-element .paint-element-text {
+  flex: 1 1 auto;
+  height: auto;
 }
 
 .paint-element-text {
@@ -3681,6 +3713,57 @@ body {
 }
 
 .paint-selection-btn svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.paint-marquee {
+  position: absolute;
+  z-index: 999999;
+  border: 1px solid rgba(191, 202, 216, .82);
+  background: rgba(191, 202, 216, .12);
+  pointer-events: none;
+}
+
+.paint-group-selection-box {
+  position: absolute;
+  z-index: 999998;
+  border: 1px solid rgba(191, 202, 216, .96);
+  box-shadow: 0 0 0 1px rgba(20, 22, 25, .7);
+  cursor: move;
+}
+
+.paint-group-delete {
+  position: absolute;
+  top: -34px;
+  right: -1px;
+  z-index: 3;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: rgba(20, 22, 25, .94);
+  box-shadow: var(--shadow);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.paint-group-delete:hover {
+  border-color: var(--line-2);
+  background: rgba(239, 68, 68, .75);
+  color: var(--text);
+}
+
+.paint-group-delete svg {
   width: 17px;
   height: 17px;
   fill: none;

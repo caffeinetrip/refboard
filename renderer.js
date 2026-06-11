@@ -160,6 +160,7 @@ let V = {
   paintHistory: {},
   paintViewportReady: {},
   paintSelection: null,
+  paintMultiSelection: [],
   paintConnectorFrom: null,
 };
 
@@ -675,6 +676,7 @@ function ensurePaintElementShape(element) {
     element.h = clampNumber(element.h, element.type === 'note' || element.type === 'block' ? 150 : 120, 24, 5000);
     element.text ??= '';
     element.fontSize = clampNumber(element.fontSize, element.type === 'block' ? 14 : 18, 10, 120);
+    if (element.type === 'block') element.title = String(element.title || '');
     return element;
   }
   if (element.type === 'text') {
@@ -5348,7 +5350,7 @@ function bindMoodboardViewport(viewport, canvas, board) {
   let panStartX = 0, panStartY = 0, panStartPX = 0, panStartPY = 0;
 
   const onKeyDown = e => {
-    if (e.code === 'Space' && !['INPUT','TEXTAREA'].includes(document.activeElement?.tagName)) {
+    if (e.code === 'Space' && !['INPUT','TEXTAREA'].includes(document.activeElement?.tagName) && document.activeElement?.isContentEditable !== true) {
       e.preventDefault();
       V._mbPanMode = true;
       viewport.classList.add('pan-mode');
@@ -6567,6 +6569,90 @@ function renderPaintElements(owner, ownerKind, workspace, board) {
       const node = createPaintElementNode(element, board, owner, ownerKind, workspace, false);
       if (node) canvas.appendChild(node);
     });
+  renderPaintGroupSelectionBox(owner, ownerKind, workspace, board);
+}
+
+function paintMultiSelectionIds(board) {
+  const valid = new Set((board?.elements || []).map(element => element.id));
+  V.paintMultiSelection = (Array.isArray(V.paintMultiSelection) ? V.paintMultiSelection : [])
+    .filter(id => valid.has(id));
+  return V.paintMultiSelection;
+}
+
+function selectedPaintElements(board) {
+  const ids = new Set(paintMultiSelectionIds(board));
+  return (board?.elements || []).filter(element => ids.has(element.id) && paintIsTileElement(element));
+}
+
+function clearPaintMultiSelection() {
+  V.paintMultiSelection = [];
+}
+
+function renderPaintGroupSelectionBox(owner, ownerKind, workspace, board) {
+  const canvas = $('paint-canvas');
+  if (!canvas) return;
+  const items = selectedPaintElements(board);
+  if (items.length < 2) return;
+  const bounds = paintBoundsForElements(items, board);
+  if (!bounds) return;
+  const box = document.createElement('div');
+  box.id = 'paint-group-selection-box';
+  box.className = 'paint-group-selection-box';
+  box.style.left = `${Math.round(bounds.x)}px`;
+  box.style.top = `${Math.round(bounds.y)}px`;
+  box.style.width = `${Math.max(1, Math.round(bounds.w))}px`;
+  box.style.height = `${Math.max(1, Math.round(bounds.h))}px`;
+  box.innerHTML = `<button class="paint-group-delete" title="Delete selected">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 7h12M10 7V5h4v2M9 10v8M15 10v8M8 7l1 13h6l1-13"/></svg>
+  </button>`;
+  box.addEventListener('pointerdown', e => {
+    if (e.target.closest('.paint-group-delete')) return;
+    startPaintGroupMove(e, owner, ownerKind, workspace, board);
+  });
+  box.querySelector('.paint-group-delete').addEventListener('click', e => {
+    e.stopPropagation();
+    pushPaintUndo(board);
+    const ids = new Set(paintMultiSelectionIds(board));
+    board.elements = (board.elements || []).filter(element =>
+      !ids.has(element.id) && !ids.has(element.fromId) && !ids.has(element.toId)
+    );
+    clearPaintMultiSelection();
+    V.paintSelection = null;
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+    rerenderPaintWorkspace(owner, ownerKind);
+  });
+  canvas.appendChild(box);
+}
+
+function startPaintGroupMove(e, owner, ownerKind, workspace, board) {
+  if (e.button !== 0) return;
+  const targets = selectedPaintElements(board);
+  if (!targets.length) return;
+  e.preventDefault();
+  e.stopPropagation();
+  pushPaintUndo(board);
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const zoom = board.zoom || 1;
+  const snaps = targets.map(element => paintElementSnapshot(element));
+  const onMove = mv => {
+    const dx = (mv.clientX - startX) / zoom;
+    const dy = (mv.clientY - startY) / zoom;
+    targets.forEach((element, i) => {
+      applyPaintElementMove(element, snaps[i], dx, dy);
+      element.updatedAt = now();
+    });
+    syncPaintConnectorNodes(board);
+    renderPaintElements(owner, ownerKind, workspace, board);
+  };
+  const onUp = () => {
+    document.removeEventListener('pointermove', onMove, true);
+    document.removeEventListener('pointerup', onUp, true);
+    touchPaintWorkspace(owner, ownerKind, workspace, board);
+    renderPaintElements(owner, ownerKind, workspace, board);
+  };
+  document.addEventListener('pointermove', onMove, true);
+  document.addEventListener('pointerup', onUp, true);
 }
 
 function createPaintElementNode(element, board, owner, ownerKind, workspace, preview = false) {
@@ -6619,7 +6705,7 @@ function createPaintElementNode(element, board, owner, ownerKind, workspace, pre
     el.style.borderColor = element.color;
     el.style.background = element.fill === 'transparent' ? '#191d22' : element.fill;
     el.style.fontSize = `${Math.round(element.fontSize || 14)}px`;
-    el.innerHTML = `<div class="paint-element-text">${esc(element.text || 'Block').replace(/\n/g, '<br>')}</div>`;
+    el.innerHTML = `<div class="paint-element-title" data-paint-field="title">${esc(element.title || '').replace(/\n/g, '<br>') || '<span class="paint-title-placeholder">Title</span>'}</div><div class="paint-element-text" data-paint-field="text">${esc(element.text || 'Block').replace(/\n/g, '<br>')}</div>`;
   } else if (element.type === 'image') {
     const media = getMediaById(element.mediaId);
     el.classList.add('paint-image-element');
@@ -6659,7 +6745,8 @@ function createPaintElementNode(element, board, owner, ownerKind, workspace, pre
     if (paintElementHasInlineText(element)) {
       el.addEventListener('dblclick', e => {
         e.stopPropagation();
-        editPaintText(owner, ownerKind, workspace, board, element);
+        const field = e.target.closest('.paint-element-title') ? 'title' : 'text';
+        editPaintText(owner, ownerKind, workspace, board, element, { field });
       });
     }
     if (element.type === 'image') {
@@ -6773,14 +6860,15 @@ function paintBoundsForElements(elements, board = null) {
 
 function handlePaintElementPointerDown(e, owner, ownerKind, workspace, board, element, el) {
   if (e.button !== 0) return;
-  if (e.target.closest('.paint-element-text.editing, .paint-element-text[contenteditable="true"]')) {
+  if (e.target.closest('.paint-element-text.editing, .paint-element-text[contenteditable="true"], .paint-element-title.editing, .paint-element-title[contenteditable="true"]')) {
     e.stopPropagation();
     return;
   }
   if (e.detail > 1 && paintElementHasInlineText(element)) {
     e.preventDefault();
     e.stopPropagation();
-    editPaintText(owner, ownerKind, workspace, board, element);
+    const field = e.target.closest('.paint-element-title') ? 'title' : 'text';
+    editPaintText(owner, ownerKind, workspace, board, element, { field });
     return;
   }
   const dot = e.target.closest('.paint-connect-dot');
@@ -6788,9 +6876,13 @@ function handlePaintElementPointerDown(e, owner, ownerKind, workspace, board, el
     startPaintConnectorDrag(e, owner, ownerKind, workspace, board, element, dot.dataset.side || 's');
     return;
   }
+  if (e.target.closest('.paint-selection-toolbar')) {
+    return;
+  }
   e.preventDefault();
   e.stopPropagation();
   V.paintSelection = element.id;
+  V.paintMultiSelection = [];
   if (e.target.closest('.paint-resize-handle')) {
     startPaintElementResize(e, owner, ownerKind, workspace, board, element, el);
   } else {
@@ -6799,16 +6891,23 @@ function handlePaintElementPointerDown(e, owner, ownerKind, workspace, board, el
 }
 
 function startPaintElementMove(e, owner, ownerKind, workspace, board, element, el) {
-  pushPaintUndo(board);
-  bringPaintElementForward(board, element);
-  el.classList.add('moving', 'selected');
+  const wasSelected = V.paintSelection === element.id;
   const startX = e.clientX;
   const startY = e.clientY;
   const zoom = board.zoom || 1;
   const snap = paintElementSnapshot(element);
+  let moved = false;
+  let undone = false;
   const onMove = mv => {
     const dx = (mv.clientX - startX) / zoom;
     const dy = (mv.clientY - startY) / zoom;
+    if (!moved) {
+      if (Math.abs(mv.clientX - startX) < 3 && Math.abs(mv.clientY - startY) < 3) return;
+      moved = true;
+      if (!undone) { pushPaintUndo(board); undone = true; }
+      bringPaintElementForward(board, element);
+      el.classList.add('moving', 'selected');
+    }
     applyPaintElementMove(element, snap, dx, dy);
     const bounds = paintElementBounds(element, board);
     if (bounds) {
@@ -6824,8 +6923,12 @@ function startPaintElementMove(e, owner, ownerKind, workspace, board, element, e
     el.classList.remove('moving');
     document.removeEventListener('pointermove', onMove, true);
     document.removeEventListener('pointerup', onUp, true);
-    touchPaintWorkspace(owner, ownerKind, workspace, board);
-    renderPaintElements(owner, ownerKind, workspace, board);
+    if (moved) {
+      touchPaintWorkspace(owner, ownerKind, workspace, board);
+      renderPaintElements(owner, ownerKind, workspace, board);
+    } else if (!wasSelected) {
+      renderPaintElements(owner, ownerKind, workspace, board);
+    }
   };
   document.addEventListener('pointermove', onMove, true);
   document.addEventListener('pointerup', onUp, true);
@@ -6995,7 +7098,8 @@ function applyPaintElementMove(element, snap, dx, dy) {
 
 function editPaintText(owner, ownerKind, workspace, board, element, options = {}) {
   const node = getPaintElementNode(element.id);
-  const host = node?.querySelector('.paint-element-text');
+  const field = options.field === 'title' ? 'title' : 'text';
+  const host = field === 'title' ? node?.querySelector('.paint-element-title') : node?.querySelector('.paint-element-text');
   if (!host) return;
   const placeCaret = () => {
     host.focus({ preventScroll: true });
@@ -7010,13 +7114,15 @@ function editPaintText(owner, ownerKind, workspace, board, element, options = {}
     placeCaret();
     return;
   }
-  const before = element.text || '';
+  const before = field === 'title' ? (element.title || '') : (element.text || '');
   if (options.pushUndo !== false) pushPaintUndo(board);
   V.paintSelection = element.id;
   node.classList.add('editing', 'selected');
   host.setAttribute('contenteditable', 'true');
   host.spellcheck = false;
   host.classList.add('editing');
+  host.querySelector?.('.paint-title-placeholder')?.remove();
+  if (field === 'title' && !host.textContent.trim()) host.innerHTML = '';
   requestAnimationFrame(placeCaret);
   let finished = false;
   const finish = save => {
@@ -7028,7 +7134,11 @@ function editPaintText(owner, ownerKind, workspace, board, element, options = {}
     host.removeEventListener('blur', onBlur);
     host.removeEventListener('keydown', onKeyDown);
     host.removeEventListener('pointerdown', onPointerDown, true);
-    element.text = save ? host.innerText.trim() || (element.type === 'block' ? 'Block' : element.type === 'note' ? 'Note' : 'Text') : before;
+    if (field === 'title') {
+      element.title = save ? host.innerText.trim() : before;
+    } else {
+      element.text = save ? host.innerText.trim() || (element.type === 'block' ? 'Block' : element.type === 'note' ? 'Note' : 'Text') : before;
+    }
     element.updatedAt = now();
     touchPaintWorkspace(owner, ownerKind, workspace, board);
     rerenderPaintWorkspace(owner, ownerKind);
@@ -7066,7 +7176,8 @@ function bindPaintViewport(owner, ownerKind, workspace, board, viewport, canvas)
     e.preventDefault();
     e.stopPropagation();
     V.paintSelection = element.id;
-    editPaintText(owner, ownerKind, workspace, board, element);
+    const field = e.target.closest('.paint-element-title') ? 'title' : 'text';
+    editPaintText(owner, ownerKind, workspace, board, element, { field });
   }, true);
 
   viewport.addEventListener('wheel', e => {
@@ -7100,7 +7211,7 @@ function bindPaintViewport(owner, ownerKind, workspace, board, viewport, canvas)
   let panStartPY = 0;
 
   const onKeyDown = e => {
-    if (e.code === 'Space' && !['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) {
+    if (e.code === 'Space' && !['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName) && document.activeElement?.isContentEditable !== true) {
       e.preventDefault();
       V._paintPanMode = true;
       viewport.classList.add('pan-mode');
@@ -7132,15 +7243,75 @@ function bindPaintViewport(owner, ownerKind, workspace, board, viewport, canvas)
   };
 
   viewport.addEventListener('pointerdown', e => {
-    if (e.target.closest('.paint-element, .paint-empty-box')) return;
+    if (e.target.closest('.paint-element, .paint-empty-box, .paint-group-selection-box')) return;
     if (e.button === 2 || e.button === 1 || (e.button === 0 && V._paintPanMode)) {
       startPan(e);
       return;
     }
     if (e.button !== 0) return;
-    V.paintSelection = null;
-    V.paintConnectorFrom = null;
-    renderPaintElements(owner, ownerKind, workspace, board);
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    const additive = e.shiftKey || e.ctrlKey || e.metaKey;
+    const baseIds = additive ? [...paintMultiSelectionIds(board)] : [];
+    const start = paintWorldPoint(e, viewport, board);
+    let cur = { ...start };
+    let moved = false;
+
+    const marqueeEl = document.createElement('div');
+    marqueeEl.className = 'paint-marquee';
+    canvas.appendChild(marqueeEl);
+    const setMarqueeRect = rect => {
+      marqueeEl.style.left = `${Math.round(rect.x)}px`;
+      marqueeEl.style.top = `${Math.round(rect.y)}px`;
+      marqueeEl.style.width = `${Math.max(1, Math.round(rect.w))}px`;
+      marqueeEl.style.height = `${Math.max(1, Math.round(rect.h))}px`;
+    };
+    setMarqueeRect({ x: start.x, y: start.y, w: 0, h: 0 });
+
+    const onMove = mv => {
+      cur = paintWorldPoint(mv, viewport, board);
+      const rect = {
+        x: Math.min(start.x, cur.x),
+        y: Math.min(start.y, cur.y),
+        w: Math.abs(start.x - cur.x),
+        h: Math.abs(start.y - cur.y),
+      };
+      moved = moved || rect.w > 3 || rect.h > 3;
+      setMarqueeRect(rect);
+    };
+    const onUp = () => {
+      document.removeEventListener('pointermove', onMove, true);
+      document.removeEventListener('pointerup', onUp, true);
+      marqueeEl.remove();
+      if (moved) {
+        const rect = {
+          x: Math.min(start.x, cur.x),
+          y: Math.min(start.y, cur.y),
+          w: Math.abs(start.x - cur.x),
+          h: Math.abs(start.y - cur.y),
+        };
+        const hits = (board.elements || [])
+          .filter(paintIsTileElement)
+          .filter(element => {
+            const bounds = paintElementBounds(element, board);
+            return bounds && rectsIntersect(rect, bounds);
+          })
+          .map(element => element.id);
+        const next = new Set(baseIds);
+        hits.forEach(id => next.add(id));
+        V.paintMultiSelection = [...next];
+        V.paintSelection = next.size === 1 ? [...next][0] : null;
+      } else if (!additive) {
+        V.paintMultiSelection = [];
+        V.paintSelection = null;
+        V.paintConnectorFrom = null;
+      }
+      renderPaintElements(owner, ownerKind, workspace, board);
+    };
+    document.addEventListener('pointermove', onMove, true);
+    document.addEventListener('pointerup', onUp, true);
   });
 
   viewport.addEventListener('pointermove', e => {
