@@ -145,6 +145,9 @@ function freshState() {
     projectSearch: '',
     noteSearch: '',
     notes: null,
+    podcasts: null,
+    tiktok: null,
+    marketing: null,
     dailies: null,
     moodboard: null,
     drawing: null,
@@ -185,6 +188,9 @@ let V = {
   paintSelection: null,
   paintMultiSelection: [],
   paintConnectorFrom: null,
+  typeFindQuery: '',
+  typeFindTimer: null,
+  typeFindCurrent: null,
 };
 
 let activeGifCache = null;
@@ -283,6 +289,89 @@ function searchMatches(parts, query) {
   return parts.some(part => String(part || '').toLowerCase().includes(q));
 }
 
+function typeFindText(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function clearTypeFindHighlights() {
+  document.querySelectorAll('.typefind-match, .typefind-current').forEach(el => {
+    el.classList.remove('typefind-match', 'typefind-current');
+  });
+  V.typeFindCurrent = null;
+}
+
+function typeFindCandidates() {
+  const menu = $('category-menu');
+  if (menu) {
+    return Array.from(menu.querySelectorAll('[data-typefind-text]'))
+      .filter(el => el.getClientRects().length);
+  }
+  return Array.from(document.querySelectorAll('[data-typefind-text]'))
+    .filter(el => el.getClientRects().length && !el.closest('.hidden'));
+}
+
+function applyTypeFindHighlights() {
+  document.querySelectorAll('.typefind-match, .typefind-current').forEach(el => {
+    el.classList.remove('typefind-match', 'typefind-current');
+  });
+  const query = typeFindText(V.typeFindQuery);
+  if (!query) return false;
+  const viewportCenter = window.innerHeight / 2;
+  const matches = typeFindCandidates()
+    .map(el => {
+      const text = typeFindText(el.dataset.typefindText);
+      const index = text.indexOf(query);
+      if (index < 0) return null;
+      const rect = el.getBoundingClientRect();
+      return {
+        el,
+        index,
+        distance: Math.abs(rect.top + rect.height / 2 - viewportCenter),
+        startsWith: text.startsWith(query) ? 0 : 1,
+      };
+    })
+    .filter(Boolean);
+  matches.forEach(match => match.el.classList.add('typefind-match'));
+  if (!matches.length) return true;
+  matches.sort((a, b) => a.startsWith - b.startsWith || a.distance - b.distance || a.index - b.index);
+  const current = matches[0].el;
+  current.classList.add('typefind-current');
+  V.typeFindCurrent = current;
+  current.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' });
+  return true;
+}
+
+function handleTypeFindKey(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return false;
+  const candidates = typeFindCandidates();
+  if (!candidates.length) return false;
+  if (e.key === 'Escape') {
+    if (!V.typeFindQuery) return false;
+    V.typeFindQuery = '';
+    clearTypeFindHighlights();
+    e.preventDefault();
+    return true;
+  }
+  if (e.key === 'Backspace') {
+    if (!V.typeFindQuery) return false;
+    V.typeFindQuery = V.typeFindQuery.slice(0, -1);
+  } else if (e.key && e.key.length === 1) {
+    if (e.key === ' ' && !V.typeFindQuery) return false;
+    V.typeFindQuery += e.key;
+  } else {
+    return false;
+  }
+  clearTimeout(V.typeFindTimer);
+  V.typeFindTimer = setTimeout(() => {
+    V.typeFindQuery = '';
+    clearTypeFindHighlights();
+  }, 1800);
+  applyTypeFindHighlights();
+  e.preventDefault();
+  e.stopPropagation();
+  return true;
+}
+
 function importanceLevel(value) {
   return IMPORTANCE_LEVELS.find(level => level.id === value) || IMPORTANCE_LEVELS[0];
 }
@@ -367,6 +456,11 @@ function importanceOptions(value) {
 function importanceBadgeHTML(value) {
   const level = importanceLevel(value);
   return `<button type="button" class="rarity-badge rarity-${esc(level.id)}" title="Importance: ${esc(level.label)}">${esc(level.short)}</button>`;
+}
+
+function importanceChipHTML(value) {
+  const level = importanceLevel(value);
+  return `<span class="rarity-badge rarity-${esc(level.id)}" title="Importance: ${esc(level.label)}">${esc(level.short)}</span>`;
 }
 
 function importanceMenuButtonHTML(value) {
@@ -493,8 +587,9 @@ function openCategoryMenu(anchor, categories, activeId, onPick, options = {}) {
   menu.innerHTML = `
     <div class="category-menu-title">${esc(title)}</div>
     ${categories.map(category => `
-      <button class="category-choice ${sameId(category.id, activeId) ? 'active' : ''}" data-category="${esc(category.id)}">
-        <span>${esc(category.title)}</span>
+      <button class="category-choice ${sameId(category.id, activeId) ? 'active' : ''}" data-category="${esc(category.id)}" data-typefind-text="${esc(category.title)}">
+        ${importanceChipHTML(category.importance)}
+        <span class="category-choice-title">${esc(category.title)}</span>
         ${typeof options.countFor === 'function' ? `<small>${options.countFor(category)}</small>` : ''}
       </button>`).join('')}`;
   document.body.appendChild(menu);
@@ -509,6 +604,7 @@ function openCategoryMenu(anchor, categories, activeId, onPick, options = {}) {
       closeCategoryMenu();
     };
   });
+  applyTypeFindHighlights();
   categoryMenuCloseHandler = e => {
     if (menu.contains(e.target) || anchor.contains(e.target)) return;
     closeCategoryMenu();
@@ -580,13 +676,14 @@ function ensurePhotoBoardShape(board) {
 }
 
 function defaultPaintCategory() {
-  return { id: 'paintcat_default', title: 'Main', createdAt: now(), updatedAt: now() };
+  return { id: 'paintcat_default', title: 'Main', importance: 'common', createdAt: now(), updatedAt: now() };
 }
 
 function ensurePaintCategoryShape(category, fallback = 'Main') {
   if (!category || typeof category !== 'object') category = {};
   category.id ??= 'paintcat_' + uid();
   category.title ??= fallback;
+  category.importance = importanceLevel(category.importance).id;
   category.createdAt ??= now();
   category.updatedAt ??= now();
   return category;
@@ -940,12 +1037,14 @@ function ensureProjectShape(project) {
 }
 
 function defaultBlockCategory() {
-  return { id: 'blockcat_default', title: 'Main', createdAt: now(), updatedAt: now() };
+  return { id: 'blockcat_default', title: 'Main', importance: 'common', createdAt: now(), updatedAt: now() };
 }
 
 function ensureBlockCategoryShape(category, fallback = 'Main') {
   category.id = String(category.id ?? 'blockcat_' + uid());
   category.title ??= fallback;
+  category.parentId = category.parentId ? String(category.parentId) : null;
+  category.importance = importanceLevel(category.importance).id;
   category.createdAt ??= now();
   category.updatedAt ??= now();
   return category;
@@ -971,6 +1070,12 @@ function ensureBlockContainerShape(container) {
   container.categories = Array.isArray(container.categories) && container.categories.length
     ? container.categories.map((category, index) => ensureBlockCategoryShape(category, index ? 'Category' : 'Main'))
     : [defaultBlockCategory()];
+  const categoryIds = new Set(container.categories.map(category => category.id));
+  container.categories.forEach(category => {
+    if (!category.parentId || !categoryIds.has(category.parentId) || sameId(category.parentId, category.id)) {
+      category.parentId = null;
+    }
+  });
   container.activeCategoryId = String(container.activeCategoryId ?? container.categories[0]?.id ?? 'blockcat_default');
   container.blocks.forEach(block => {
     if (!container.categories.some(category => sameId(category.id, block.categoryId))) block.categoryId = container.categories[0].id;
@@ -986,6 +1091,53 @@ function ensureNotesShape(notes) {
   notes.createdAt ??= now();
   notes.updatedAt ??= now();
   return notes;
+}
+
+function createReferenceNotebook(id, title) {
+  return {
+    id,
+    title,
+    blocks: [],
+    categoryOpen: false,
+    createdAt: now(),
+    updatedAt: now(),
+  };
+}
+
+const OLD_REFERENCE_SEED_TITLES = {
+  podcasts: ['Ideas', 'Episodes', 'Guests', 'Clips'],
+  tiktok: ['Hooks', 'Formats', 'Scripts', 'Sounds', 'Editing', 'Competitors', 'Wins'],
+  marketing: ['Audience', 'Offer', 'Angles', 'Proof', 'Ads', 'Landing', 'Competitors'],
+};
+
+function removeUnusedReferenceSeeds(notebook, id) {
+  const oldTitles = OLD_REFERENCE_SEED_TITLES[id];
+  if (!oldTitles || notebook.blocks.length) return;
+  const titles = (notebook.categories || []).map(category => String(category.title || ''));
+  if (!titles.length || !titles.every(title => oldTitles.includes(title))) return;
+  notebook.categories = [defaultBlockCategory()];
+  notebook.activeCategoryId = notebook.categories[0].id;
+}
+
+function ensureReferenceNotebookShape(notebook, id, title) {
+  const source = notebook && typeof notebook === 'object' ? notebook : createReferenceNotebook(id, title);
+  const next = ensureNotesShape(source);
+  if (!notebook?.id || next.id === 'notes') next.id = id;
+  if (!notebook?.title || next.title === 'Notes') next.title = title;
+  removeUnusedReferenceSeeds(next, id);
+  return next;
+}
+
+function ensurePodcastsShape(podcasts) {
+  return ensureReferenceNotebookShape(podcasts, 'podcasts', 'Podcasts');
+}
+
+function ensureTikTokShape(tiktok) {
+  return ensureReferenceNotebookShape(tiktok, 'tiktok', 'TikTok');
+}
+
+function ensureMarketingShape(marketing) {
+  return ensureReferenceNotebookShape(marketing, 'marketing', 'Marketing');
 }
 
 function notesFromLegacyDailyNotes(dailyNotes) {
@@ -1044,13 +1196,14 @@ function ensureDailyTemplateShape(template, index = 0) {
 }
 
 function defaultDailyTemplateCategory() {
-  return { id: 'dtcat_default', title: 'Default', createdAt: now(), updatedAt: now() };
+  return { id: 'dtcat_default', title: 'Default', importance: 'common', createdAt: now(), updatedAt: now() };
 }
 
 function ensureDailyTemplateCategoryShape(category, index = 0) {
   if (!category || typeof category !== 'object') category = {};
   category.id ??= 'dtcat_' + uid();
   category.title ??= index ? 'Preset' : 'Default';
+  category.importance = importanceLevel(category.importance).id;
   category.createdAt ??= now();
   category.updatedAt ??= now();
   return category;
@@ -1272,6 +1425,9 @@ function clampNumber(value, fallback, min, max) {
 
 function ensureWorkspaceShape() {
   S.notes = ensureNotesShape(S.notes);
+  S.podcasts = ensurePodcastsShape(S.podcasts);
+  S.tiktok = ensureTikTokShape(S.tiktok);
+  S.marketing = ensureMarketingShape(S.marketing);
   S.dailies = ensureDailiesShape(S.dailies);
   S.moodboard = ensureMoodboardShape(S.moodboard);
   S.drawing = ensureDrawingShape(S.drawing);
@@ -1509,11 +1665,50 @@ function getActiveBlockCategory(container) {
   return category;
 }
 
-function addBlockCategory(container, onDone) {
-  askText('New Category', '', 'Create', title => {
+function blockCategoryChildren(container, parentId = null) {
+  ensureBlockContainerShape(container);
+  return container.categories.filter(category => parentId
+    ? sameId(category.parentId, parentId)
+    : !category.parentId);
+}
+
+function blockCategoryDescendantIds(container, categoryId) {
+  ensureBlockContainerShape(container);
+  const ids = new Set();
+  const visit = id => {
+    if (ids.has(String(id))) return;
+    ids.add(String(id));
+    blockCategoryChildren(container, id).forEach(child => visit(child.id));
+  };
+  if (categoryId) visit(categoryId);
+  return ids;
+}
+
+function blockCountForCategoryTree(container, categoryId) {
+  const ids = blockCategoryDescendantIds(container, categoryId);
+  return container.blocks.filter(block => ids.has(String(ensureBlockShape(block).categoryId))).length;
+}
+
+function blockCategoryPath(container, category) {
+  ensureBlockContainerShape(container);
+  const byId = new Map(container.categories.map(item => [String(item.id), item]));
+  const path = [];
+  let current = category;
+  const seen = new Set();
+  while (current && !seen.has(String(current.id))) {
+    path.unshift(current);
+    seen.add(String(current.id));
+    current = current.parentId ? byId.get(String(current.parentId)) : null;
+  }
+  return path;
+}
+
+function addBlockCategory(container, onDone, parentId = null, label = 'Category') {
+  askText(`New ${label}`, '', 'Create', title => {
     const category = ensureBlockCategoryShape({
       id: 'blockcat_' + uid(),
       title,
+      parentId,
       createdAt: now(),
       updatedAt: now(),
     });
@@ -1535,6 +1730,7 @@ function blockCategoryControlsHTML(container, prefix) {
         <small>${activeCount}</small>
         <span class="select-caret">v</span>
       </button>
+      <span class="category-importance-control" id="${esc(prefix)}-category-importance">${importanceBadgeHTML(active.importance)}</span>
       <button class="mini-btn" id="${esc(prefix)}-category-add">+ Category</button>
       <button class="ghost-btn" id="${esc(prefix)}-sort-importance">Sort importance</button>
       <button class="ghost-btn" id="${esc(prefix)}-copy-category">Copy category</button>
@@ -1558,6 +1754,13 @@ function bindBlockCategoryControls(container, prefix, onChange) {
   }
   const add = $(`${prefix}-category-add`);
   if (add) add.onclick = () => addBlockCategory(container, () => onChange(true));
+  const categoryImportance = $(`${prefix}-category-importance`);
+  bindImportanceTriggers(categoryImportance, () => getActiveBlockCategory(container).importance, value => {
+    const category = getActiveBlockCategory(container);
+    category.importance = value;
+    category.updatedAt = now();
+    onChange(true);
+  });
   const sort = $(`${prefix}-sort-importance`);
   if (sort) sort.onclick = () => {
     sortBlocksByImportance(container, getActiveBlockCategory(container).id);
@@ -1580,6 +1783,7 @@ function mediaCategoryControlsHTML(owner, kind, prefix, scope) {
         <small>${activeCount}</small>
         <span class="select-caret">v</span>
       </button>
+      <span class="category-importance-control" id="${esc(prefix)}-category-importance">${importanceBadgeHTML(active.importance)}</span>
       <button class="mini-btn" id="${esc(prefix)}-category-add">+ Category</button>
     </div>`;
 }
@@ -1600,6 +1804,13 @@ function bindMediaCategoryControls(owner, kind, prefix, scope, onChange) {
   }
   const add = $(`${prefix}-category-add`);
   if (add) add.onclick = () => createMediaCategoryFlow(owner, kind, () => onChange(true));
+  const categoryImportance = $(`${prefix}-category-importance`);
+  bindImportanceTriggers(categoryImportance, () => getActiveMediaCategory(owner, kind).importance, value => {
+    const category = getActiveMediaCategory(owner, kind);
+    category.importance = value;
+    category.updatedAt = now();
+    onChange(true);
+  });
 }
 
 function createMediaCategoryFlow(owner, kind, onDone) {
@@ -1732,12 +1943,13 @@ function touchProject(project) {
 }
 
 function defaultImageCategory() {
-  return { id: 'imgcat_default', title: 'Main', createdAt: now(), updatedAt: now() };
+  return { id: 'imgcat_default', title: 'Main', importance: 'common', createdAt: now(), updatedAt: now() };
 }
 
 function ensureImageCategoryShape(category, fallback = 'Main') {
   category.id ??= 'imgcat_' + uid();
   category.title ??= fallback;
+  category.importance = importanceLevel(category.importance).id;
   category.createdAt ??= now();
   category.updatedAt ??= now();
   return category;
@@ -2412,6 +2624,27 @@ function returnToViewRoot(view) {
     renderApp();
     return true;
   }
+  if (view === 'podcasts' && S.podcasts?.categoryOpen) {
+    S.podcasts.categoryOpen = false;
+    S.podcasts.updatedAt = now();
+    markDirty();
+    renderApp();
+    return true;
+  }
+  if (view === 'tiktok' && S.tiktok?.categoryOpen) {
+    S.tiktok.categoryOpen = false;
+    S.tiktok.updatedAt = now();
+    markDirty();
+    renderApp();
+    return true;
+  }
+  if (view === 'marketing' && S.marketing?.categoryOpen) {
+    S.marketing.categoryOpen = false;
+    S.marketing.updatedAt = now();
+    markDirty();
+    renderApp();
+    return true;
+  }
   if (view === 'drawing' && S.drawing?.categoryOpen) {
     S.drawing.categoryOpen = false;
     S.drawing.updatedAt = now();
@@ -2455,6 +2688,9 @@ function setView(view, options = {}) {
   closeCategoryMenu();
   if (!options.skipHistory && S.view !== view) pushRoute();
   if (view === 'daily-notes') S.activeDailyNoteId = null;
+  if (view === 'podcasts') S.activeDailyNoteId = null;
+  if (view === 'tiktok') S.activeDailyNoteId = null;
+  if (view === 'marketing') S.activeDailyNoteId = null;
   if (view === 'photo-boards') S.activePhotoBoardId = null;
   if (view === 'projects') S.activeProjectId = null;
   if (view === 'dailies') {
@@ -2486,6 +2722,9 @@ function renderApp() {
   renderMiniGames();
   if (S.view === 'game') renderGameWorkspace();
   else if (S.view === 'daily-notes') renderNotes();
+  else if (S.view === 'podcasts') renderPodcasts();
+  else if (S.view === 'tiktok') renderTikTok();
+  else if (S.view === 'marketing') renderMarketing();
   else if (S.view === 'dailies') renderDailies();
   else if (S.view === 'moodboard') renderMoodboard();
   else if (S.view === 'drawing') renderDrawing();
@@ -2569,17 +2808,347 @@ function renderLibraryCards() {
   body.innerHTML = '<div class="games-grid" id="games-grid"></div>';
   const grid = $('games-grid');
   games.forEach(game => grid.appendChild(buildGameCard(game)));
+  applyTypeFindHighlights();
+}
+
+const NOTEBOOK_CONFIGS = {
+  notes: {
+    stateKey: 'notes',
+    view: 'daily-notes',
+    title: 'Notes',
+    mark: 'N',
+    prefix: 'notes',
+    mediaScope: 'notes',
+    ownerName: 'notes',
+    itemLabel: 'notes',
+  },
+  podcasts: {
+    stateKey: 'podcasts',
+    view: 'podcasts',
+    title: 'Podcasts',
+    mark: 'P',
+    prefix: 'podcasts',
+    mediaScope: 'podcasts',
+    ownerName: 'podcasts',
+    itemLabel: 'items',
+  },
+  tiktok: {
+    stateKey: 'tiktok',
+    view: 'tiktok',
+    title: 'TikTok',
+    mark: 'T',
+    prefix: 'tiktok',
+    mediaScope: 'tiktok',
+    ownerName: 'tiktok',
+    itemLabel: 'refs',
+  },
+  marketing: {
+    stateKey: 'marketing',
+    view: 'marketing',
+    title: 'Marketing',
+    mark: 'A',
+    prefix: 'marketing',
+    mediaScope: 'marketing',
+    ownerName: 'marketing',
+    itemLabel: 'refs',
+  },
+};
+
+function notebookConfig(kind) {
+  return NOTEBOOK_CONFIGS[kind] || NOTEBOOK_CONFIGS.notes;
+}
+
+function ensureNotebookState(kind) {
+  const config = notebookConfig(kind);
+  if (config.stateKey === 'podcasts') S.podcasts = ensurePodcastsShape(S.podcasts);
+  else if (config.stateKey === 'tiktok') S.tiktok = ensureTikTokShape(S.tiktok);
+  else if (config.stateKey === 'marketing') S.marketing = ensureMarketingShape(S.marketing);
+  else S.notes = ensureNotesShape(S.notes);
+  return S[config.stateKey];
 }
 
 function renderNotes() {
+  renderNotebook('notes');
+}
+
+function renderPodcasts() {
+  renderNotebook('podcasts');
+}
+
+function renderTikTok() {
+  renderNotebook('tiktok');
+}
+
+function renderMarketing() {
+  renderNotebook('marketing');
+}
+
+function renderNotebook(kind) {
   stopViewer();
   hidePlayback();
-  S.notes = ensureNotesShape(S.notes);
-  if (!S.notes.categoryOpen) {
-    renderNotesCategoryLibrary();
+  const notebook = ensureNotebookState(kind);
+  if (!notebook.categoryOpen) {
+    renderNotebookCategoryLibrary(kind);
     return;
   }
-  renderNotesCategoryDetail();
+  renderNotebookCategoryDetail(kind);
+}
+
+function touchNotebook(kind, notebook = ensureNotebookState(kind)) {
+  notebook.updatedAt = now();
+  markDirty();
+}
+
+function activeNotebookKindForView(view = S.view) {
+  return Object.keys(NOTEBOOK_CONFIGS).find(kind => NOTEBOOK_CONFIGS[kind].view === view) || null;
+}
+
+function goUpNotebookCategory(kind = activeNotebookKindForView()) {
+  if (!kind) return false;
+  const notebook = ensureNotebookState(kind);
+  if (!notebook?.categoryOpen) return false;
+  const category = getActiveBlockCategory(notebook);
+  const parent = category?.parentId
+    ? notebook.categories.find(item => sameId(item.id, category.parentId))
+    : null;
+  if (parent) {
+    notebook.activeCategoryId = parent.id;
+    touchNotebook(kind, notebook);
+    renderNotebook(kind);
+    return true;
+  }
+  notebook.categoryOpen = false;
+  touchNotebook(kind, notebook);
+  renderNotebook(kind);
+  return true;
+}
+
+function renderNotebookCategoryLibrary(kind) {
+  const config = notebookConfig(kind);
+  const notebook = ensureNotebookState(kind);
+  $('main').innerHTML = `
+    <section class="screen">
+      <div class="screen-head">
+        <div class="title-wrap">
+          <h1 class="screen-title">${esc(config.title)}</h1>
+        </div>
+        <div class="head-actions">
+          <button class="inline-btn" id="${esc(config.prefix)}-new-category">+ Sheet</button>
+        </div>
+      </div>
+      <div class="screen-scroll" id="${esc(config.prefix)}-category-body"></div>
+    </section>`;
+
+  $(`${config.prefix}-new-category`).onclick = () => addBlockCategory(notebook, () => {
+    notebook.categoryOpen = true;
+    touchNotebook(kind, notebook);
+    renderNotebook(kind);
+  }, null, 'Sheet');
+
+  const body = $(`${config.prefix}-category-body`);
+  if (!notebook.categories.length) {
+    body.innerHTML = `
+      <div class="empty-state">
+        <div class="empty-box">
+          <div class="empty-title">Empty</div>
+          <button class="inline-btn" id="${esc(config.prefix)}-empty-category">+ Sheet</button>
+        </div>
+      </div>`;
+    $(`${config.prefix}-empty-category`).onclick = $(`${config.prefix}-new-category`).onclick;
+    return;
+  }
+  body.innerHTML = `<div class="category-card-grid" id="${esc(config.prefix)}-category-grid"></div>`;
+  const grid = $(`${config.prefix}-category-grid`);
+  const categories = blockCategoryChildren(notebook, null);
+  categories.forEach(category => {
+    const count = blockCountForCategoryTree(notebook, category.id);
+    const childCount = blockCategoryChildren(notebook, category.id).length;
+    const card = document.createElement('button');
+    card.className = `category-card importance-surface-${esc(importanceLevel(category.importance).id)}`;
+    card.dataset.typefindText = category.title || '';
+    card.innerHTML = `
+      <div class="category-card-mark">${esc(config.mark)}</div>
+      <div class="category-card-main">
+        <div class="category-card-title">${esc(category.title)}</div>
+        <div class="card-sub">${count} ${esc(config.itemLabel)}${childCount ? ` / ${childCount} sheets` : ''}</div>
+      </div>
+      <div class="category-card-meta">${importanceChipHTML(category.importance)}</div>`;
+    card.onclick = () => {
+      notebook.activeCategoryId = category.id;
+      notebook.categoryOpen = true;
+      touchNotebook(kind, notebook);
+      renderNotebook(kind);
+    };
+    grid.appendChild(card);
+  });
+  applyTypeFindHighlights();
+}
+
+function renderNotebookCategoryDetail(kind) {
+  const config = notebookConfig(kind);
+  const notebook = ensureNotebookState(kind);
+  const category = getActiveBlockCategory(notebook);
+  const parentCategory = category.parentId
+    ? notebook.categories.find(item => sameId(item.id, category.parentId))
+    : null;
+  const childCategories = blockCategoryChildren(notebook, category.id);
+  const path = blockCategoryPath(notebook, category);
+  $('main').innerHTML = `
+    <section class="screen">
+      <div class="screen-head roomy-head">
+        <div class="title-wrap">
+          <input id="${esc(config.prefix)}-category-title" class="section-title-input" value="${esc(category.title)}">
+          ${path.length > 1 ? `<div class="category-path">${path.map(item => esc(item.title)).join(' / ')}</div>` : ''}
+        </div>
+        <div class="head-actions">
+          ${importanceBadgeHTML(category.importance)}
+          <button class="danger-btn" id="${esc(config.prefix)}-delete-category">Delete Sheet</button>
+        </div>
+      </div>
+      <div class="tab-scroll">
+        <div class="category-sheet-row">
+          <button class="ghost-btn" id="${esc(config.prefix)}-back-categories">All Sheets</button>
+          ${parentCategory ? `<button class="inline-btn" id="${esc(config.prefix)}-parent-category">Back to Sheet: ${esc(parentCategory.title || 'Sheet')}</button>` : ''}
+          <button class="ghost-btn" id="${esc(config.prefix)}-child-category">+ Sheet</button>
+        </div>
+        ${childCategories.length ? `<div class="category-card-grid nested-category-grid" id="${esc(config.prefix)}-child-category-grid"></div>` : ''}
+        <div class="category-action-row">
+          <button class="ghost-btn" id="${esc(config.prefix)}-note-text">+ Text</button>
+          <button class="ghost-btn" id="${esc(config.prefix)}-note-photo">+ Photo</button>
+          <button class="ghost-btn" id="${esc(config.prefix)}-note-sound">+ Sound</button>
+          <button class="ghost-btn" id="${esc(config.prefix)}-note-video">+ Video</button>
+          <button class="ghost-btn" id="${esc(config.prefix)}-sort-importance">Sort importance</button>
+          <button class="ghost-btn" id="${esc(config.prefix)}-copy-category">Copy sheet</button>
+          <button class="ghost-btn" id="${esc(config.prefix)}-copy-all">Copy all</button>
+        </div>
+        <div class="notes-list" id="${esc(config.prefix)}-notes-list"></div>
+      </div>
+    </section>`;
+
+  $(`${config.prefix}-back-categories`).onclick = () => {
+    notebook.categoryOpen = false;
+    touchNotebook(kind, notebook);
+    renderNotebook(kind);
+  };
+  if (parentCategory && $(`${config.prefix}-parent-category`)) {
+    $(`${config.prefix}-parent-category`).onclick = () => goUpNotebookCategory(kind);
+  }
+  $(`${config.prefix}-category-title`).oninput = e => {
+    category.title = e.target.value;
+    category.updatedAt = now();
+    touchNotebook(kind, notebook);
+  };
+  bindImportanceTriggers(document.querySelector('.screen-head'), () => category.importance, value => {
+    category.importance = value;
+    category.updatedAt = now();
+    touchNotebook(kind, notebook);
+    renderNotebook(kind);
+  });
+  $(`${config.prefix}-delete-category`).onclick = () => deleteNotebookCategory(kind, category);
+  $(`${config.prefix}-child-category`).onclick = () => addBlockCategory(notebook, () => {
+    touchNotebook(kind, notebook);
+    renderNotebook(kind);
+  }, category.id, 'Sheet');
+  $(`${config.prefix}-sort-importance`).onclick = () => {
+    sortBlocksByImportance(notebook, category.id);
+    touchNotebook(kind, notebook);
+    renderNotebook(kind);
+  };
+  $(`${config.prefix}-copy-category`).onclick = () => copyBlockContainerToClipboard(notebook, category.id);
+  $(`${config.prefix}-copy-all`).onclick = () => copyBlockContainerToClipboard(notebook);
+  $(`${config.prefix}-note-text`).onclick = () => {
+    const block = createTextBlock();
+    block.categoryId = category.id;
+    notebook.blocks.push(block);
+    touchNotebook(kind, notebook);
+    renderNotebook(kind);
+  };
+  $(`${config.prefix}-note-photo`).onclick = () => addNotebookMedia(kind, 'photo');
+  $(`${config.prefix}-note-sound`).onclick = () => addNotebookMedia(kind, 'sound');
+  $(`${config.prefix}-note-video`).onclick = () => addNotebookMedia(kind, 'video');
+
+  const childGrid = $(`${config.prefix}-child-category-grid`);
+  if (childGrid) {
+    childCategories.forEach(child => {
+      const count = blockCountForCategoryTree(notebook, child.id);
+      const childCount = blockCategoryChildren(notebook, child.id).length;
+      const card = document.createElement('button');
+      card.className = `category-card importance-surface-${esc(importanceLevel(child.importance).id)}`;
+      card.dataset.typefindText = child.title || '';
+      card.innerHTML = `
+        <div class="category-card-mark">${esc(config.mark)}</div>
+        <div class="category-card-main">
+          <div class="category-card-title">${esc(child.title)}</div>
+          <div class="card-sub">${count} ${esc(config.itemLabel)}${childCount ? ` / ${childCount} sheets` : ''}</div>
+        </div>
+        <div class="category-card-meta">${importanceChipHTML(child.importance)}</div>`;
+      card.onclick = () => {
+        notebook.activeCategoryId = child.id;
+        touchNotebook(kind, notebook);
+        renderNotebook(kind);
+      };
+      childGrid.appendChild(card);
+    });
+  }
+
+  renderEditableBlocks($(`${config.prefix}-notes-list`), notebook.blocks, {
+    ownerName: config.ownerName,
+    onChange: () => touchNotebook(kind, notebook),
+    onDelete: block => {
+      notebook.blocks = notebook.blocks.filter(item => item.id !== block.id);
+      touchNotebook(kind, notebook);
+      renderNotebook(kind);
+    },
+    onReorder: () => {
+      touchNotebook(kind, notebook);
+      renderNotebook(kind);
+    },
+  }, { categoryId: getActiveBlockCategory(notebook).id });
+  applyTypeFindHighlights();
+}
+
+function deleteNotebookCategory(kind, category) {
+  const notebook = ensureNotebookState(kind);
+  const deleteIds = blockCategoryDescendantIds(notebook, category.id);
+  if (notebook.categories.length <= deleteIds.size) {
+    toast('Keep one sheet');
+    return;
+  }
+  if (!confirm(`Delete sheet "${category.title}"?`)) return;
+  const parentId = category.parentId || null;
+  notebook.blocks = notebook.blocks.filter(block => !deleteIds.has(String(ensureBlockShape(block).categoryId)));
+  notebook.categories = notebook.categories.filter(item => !deleteIds.has(String(item.id)));
+  const parent = parentId ? notebook.categories.find(item => sameId(item.id, parentId)) : null;
+  const next = parent || blockCategoryChildren(notebook, null)[0] || notebook.categories[0] || null;
+  notebook.activeCategoryId = next?.id || null;
+  notebook.categoryOpen = !!parent;
+  touchNotebook(kind, notebook);
+  renderNotebook(kind);
+}
+
+async function addNotebookMedia(kind, mediaKind) {
+  const config = notebookConfig(kind);
+  const notebook = ensureNotebookState(kind);
+  const files = await pickMediaFiles(mediaKind);
+  if (!files.length) return;
+  files.forEach(fp => {
+    const media = registerMediaFile(fp, notebook.id, mediaKind, config.mediaScope);
+    if (media) notebook.blocks.push({
+      id: uid(),
+      type: 'media',
+      mediaId: media.id,
+      title: media.name,
+      caption: '',
+      importance: 'common',
+      categoryId: getActiveBlockCategory(notebook).id,
+      height: 270,
+      createdAt: now(),
+      updatedAt: now(),
+    });
+  });
+  touchNotebook(kind, notebook);
+  renderNotebook(kind);
+  toast(`Added: ${files.length}`);
 }
 
 function renderNotesCategoryLibrary() {
@@ -2637,6 +3206,7 @@ function renderNotesCategoryLibrary() {
     };
     grid.appendChild(card);
   });
+  applyTypeFindHighlights();
 }
 
 function renderNotesCategoryDetail() {
@@ -2827,11 +3397,13 @@ function renderDailyNoteCards() {
   body.innerHTML = '<div class="games-grid" id="daily-grid"></div>';
   const grid = $('daily-grid');
   notes.forEach(note => grid.appendChild(buildDailyNoteCard(note)));
+  applyTypeFindHighlights();
 }
 
 function buildDailyNoteCard(note) {
   const card = document.createElement('div');
   card.className = `game-card note-grid-card importance-surface-${esc(importanceLevel(note.importance).id)}`;
+  card.dataset.typefindText = note.title || formatDateTitle(note.date);
   const blockCount = (note.blocks || []).length;
   card.innerHTML = `
     <div class="game-card-main">
@@ -2962,6 +3534,7 @@ function renderDailyNoteList() {
   notes.forEach(note => {
     const row = document.createElement('button');
     row.className = 'date-row' + (note.id === S.activeDailyNoteId ? ' active' : '');
+    row.dataset.typefindText = note.title || formatDateTitle(note.date);
     row.innerHTML = `
       <span>${importanceBadgeHTML(note.importance)}</span>
       <span class="date-row-main">
@@ -3006,6 +3579,7 @@ function renderDailyNoteDetail(note) {
       </div>
     </div>
     <div class="day-scroll">
+      ${blockCategoryControlsHTML(note, 'daily-detail')}
       <div class="notes-list" id="daily-blocks"></div>
     </div>`;
 
@@ -3020,6 +3594,11 @@ function renderDailyNoteDetail(note) {
     note.updatedAt = now();
     markDirty();
     renderDailyNoteDetail(note);
+  });
+  bindBlockCategoryControls(note, 'daily-detail', shouldRender => {
+    note.updatedAt = now();
+    markDirty();
+    if (shouldRender) renderDailyNoteDetail(note);
   });
   $('daily-add-text').onclick = () => {
     const block = createTextBlock();
@@ -3056,7 +3635,7 @@ function renderDailyNoteDetail(note) {
       markDirty();
       renderDailyNoteDetail(note);
     },
-  });
+  }, { categoryId: getActiveBlockCategory(note).id });
 }
 
 function renderEditableBlocks(list, blocks, callbacks, options = {}) {
@@ -3085,6 +3664,7 @@ function renderEditableBlocks(list, blocks, callbacks, options = {}) {
     ensureBlockShape(block);
     const card = document.createElement('div');
     card.className = `note-card block-note importance-surface-${esc(importanceLevel(block.importance).id)}`;
+    card.dataset.typefindText = block.title || block.text || block.caption || '';
     const moveButtons = `
       <button class="mini-btn block-move-btn" data-block-move="up" ${visibleIndex === 0 ? 'disabled' : ''}>Up</button>
       <button class="mini-btn block-move-btn" data-block-move="down" ${visibleIndex === visibleBlocks.length - 1 ? 'disabled' : ''}>Down</button>`;
@@ -3187,6 +3767,7 @@ function renderEditableBlocks(list, blocks, callbacks, options = {}) {
     list.appendChild(card);
   });
   appendSpacer();
+  applyTypeFindHighlights();
 }
 
 async function addDailyNoteMedia(note) {
@@ -4122,6 +4703,7 @@ function showDailyAllDoneEffect(day) {
 function buildGameCard(game) {
   const card = document.createElement('div');
   card.className = 'game-card';
+  card.dataset.typefindText = game.title || '';
   const cover = getMediaById(game.iconMediaId) || getMediaById(game.coverMediaId) || getGameMedia(game.id)[0];
   card.innerHTML = `
     <div class="game-card-main">
@@ -4196,11 +4778,13 @@ function renderPhotoBoardCards() {
   body.innerHTML = '<div class="games-grid" id="photo-board-grid"></div>';
   const grid = $('photo-board-grid');
   boards.forEach(board => grid.appendChild(buildPhotoBoardCard(board)));
+  applyTypeFindHighlights();
 }
 
 function buildPhotoBoardCard(board) {
   const card = document.createElement('div');
   card.className = 'game-card album-grid-card';
+  card.dataset.typefindText = board.title || '';
   const cover = getBoardPhotos(board)[0];
   card.innerHTML = `
     <div class="game-card-main">
@@ -4467,13 +5051,15 @@ function renderDrawingCategoryLibrary() {
     const items = getDrawingMedia().filter(item => item.categoryId === category.id);
     const cover = items[0];
     const card = document.createElement('button');
-    card.className = 'category-card media-category-card';
+    card.className = `category-card media-category-card importance-surface-${esc(importanceLevel(category.importance).id)}`;
+    card.dataset.typefindText = category.title || '';
     card.innerHTML = `
       <div class="category-card-cover">${cover ? mediaPreviewHTML(cover, true) : 'R'}</div>
       <div class="category-card-main">
         <div class="category-card-title">${esc(category.title)}</div>
         <div class="card-sub">${items.length} images</div>
-      </div>`;
+      </div>
+      <div class="category-card-meta">${importanceChipHTML(category.importance)}</div>`;
     card.onclick = () => {
       setActiveMediaCategory(S.drawing, 'photo', category.id);
       S.drawing.categoryOpen = true;
@@ -4483,6 +5069,7 @@ function renderDrawingCategoryLibrary() {
     };
     grid.appendChild(card);
   });
+  applyTypeFindHighlights();
 }
 
 function renderDrawingCategoryDetail() {
@@ -4496,6 +5083,7 @@ function renderDrawingCategoryDetail() {
           <input id="drawing-category-title" class="section-title-input" value="${esc(activeCategory.title)}">
         </div>
         <div class="head-actions">
+          ${importanceBadgeHTML(activeCategory.importance)}
           <button class="ghost-btn" id="drawing-back-categories">Categories</button>
           <button class="ghost-btn" id="drawing-sort-media">Sort importance</button>
           <button class="inline-btn" id="drawing-add-media">+ Images</button>
@@ -4519,6 +5107,13 @@ function renderDrawingCategoryDetail() {
     S.drawing.updatedAt = now();
     markDirty();
   };
+  bindImportanceTriggers(document.querySelector('.screen-head'), () => activeCategory.importance, value => {
+    activeCategory.importance = value;
+    activeCategory.updatedAt = now();
+    S.drawing.updatedAt = now();
+    markDirty();
+    renderDrawing();
+  });
   $('drawing-delete-category').onclick = () => deleteDrawingCategory(activeCategory);
   $('drawing-add-media').onclick = addDrawingMedia;
   $('drawing-sort-media').onclick = () => {
@@ -4686,6 +5281,7 @@ function renderMoodboardBoardLibrary() {
     const cover = (board.items || []).map(item => getMediaById(item.mediaId)).filter(Boolean)[0];
     const card = document.createElement('button');
     card.className = 'category-card media-category-card';
+    card.dataset.typefindText = board.title || '';
     card.innerHTML = `
       <div class="category-card-cover">${cover ? mediaPreviewHTML(cover, true) : 'B'}</div>
       <div class="category-card-main">
@@ -4704,6 +5300,7 @@ function renderMoodboardBoardLibrary() {
     };
     grid.appendChild(card);
   });
+  applyTypeFindHighlights();
 }
 
 function saveMoodboardViewState(board) {
@@ -5982,6 +6579,7 @@ function renderProjectCards() {
     const pct = stats.total ? Math.round((stats.done / stats.total) * 100) : 0;
     const card = document.createElement('button');
     card.className = 'project-card';
+    card.dataset.typefindText = project.title || '';
     card.innerHTML = `
       <span class="project-card-title">${esc(project.title)}</span>
       <span class="progress-track"><span style="width:${pct}%"></span></span>
@@ -5989,6 +6587,7 @@ function renderProjectCards() {
     card.onclick = () => openProjectWorkspace(project.id);
     grid.appendChild(card);
   });
+  applyTypeFindHighlights();
 }
 
 function createProjectFlow() {
@@ -6416,6 +7015,7 @@ function paintCategoryControlsHTML(workspace) {
         <small>${paintCategoryCount(workspace, active?.id)}</small>
         <span class="select-caret">v</span>
       </button>
+      <span class="category-importance-control" id="paint-category-importance">${importanceBadgeHTML(active?.importance)}</span>
       <button class="mini-btn" id="paint-category-add">+ Category</button>
       <button class="mini-btn" id="paint-category-rename">Rename</button>
       <button class="mini-btn danger-lite" id="paint-category-delete">Delete</button>
@@ -6440,6 +7040,15 @@ function bindPaintCategoryControls(owner, ownerKind, workspace) {
   }
   const add = $('paint-category-add');
   if (add) add.onclick = () => createPaintCategoryFlow(owner, ownerKind, workspace);
+  const categoryImportance = $('paint-category-importance');
+  bindImportanceTriggers(categoryImportance, () => getActivePaintCategory(workspace)?.importance, value => {
+    const category = getActivePaintCategory(workspace);
+    if (!category) return;
+    category.importance = value;
+    category.updatedAt = now();
+    touchPaintWorkspace(owner, ownerKind, workspace);
+    rerenderPaintWorkspace(owner, ownerKind);
+  });
   const rename = $('paint-category-rename');
   if (rename) rename.onclick = () => renamePaintCategory(owner, ownerKind, workspace);
   const del = $('paint-category-delete');
@@ -6479,6 +7088,7 @@ function renderPaintBoardLibrary(owner, ownerKind, workspace, content) {
   boards.forEach(board => {
     const card = document.createElement('button');
     card.className = 'category-card media-category-card paint-sheet-card';
+    card.dataset.typefindText = board.title || '';
     const cover = getPaintBoardCover(board);
     card.innerHTML = `
       <div class="category-card-cover paint-sheet-cover">${cover ? mediaPreviewHTML(cover, true) : '<span class="paint-sheet-mark">B</span>'}</div>
@@ -6502,6 +7112,7 @@ function renderPaintBoardLibrary(owner, ownerKind, workspace, content) {
   add.textContent = '+ Sheet';
   add.onclick = () => createPaintBoardFlow(owner, ownerKind, workspace);
   grid.appendChild(add);
+  applyTypeFindHighlights();
 }
 
 function getPaintBoardCover(board) {
@@ -9060,6 +9671,15 @@ function removeMedia(mediaId) {
   if (S.notes?.blocks) {
     S.notes.blocks = S.notes.blocks.filter(block => block.mediaId !== mediaId);
   }
+  if (S.podcasts?.blocks) {
+    S.podcasts.blocks = S.podcasts.blocks.filter(block => block.mediaId !== mediaId);
+  }
+  if (S.tiktok?.blocks) {
+    S.tiktok.blocks = S.tiktok.blocks.filter(block => block.mediaId !== mediaId);
+  }
+  if (S.marketing?.blocks) {
+    S.marketing.blocks = S.marketing.blocks.filter(block => block.mediaId !== mediaId);
+  }
   if (S.moodboard?.boards) {
     S.moodboard.boards.forEach(board => {
       board.items = (board.items || []).filter(item => item.mediaId !== mediaId);
@@ -9186,6 +9806,9 @@ function serializeProject() {
     type: APP_TYPE,
     createdAt: S.createdAt,
     notes: S.notes,
+    podcasts: S.podcasts,
+    tiktok: S.tiktok,
+    marketing: S.marketing,
     dailies: S.dailies,
     moodboard: S.moodboard,
     drawing: S.drawing,
@@ -9267,6 +9890,9 @@ function loadProjectData(data, fp) {
     next.games = Array.isArray(data.games) ? data.games.map(ensureGameShape).map(gameWithoutQuestions) : [];
     next.dailyNotes = Array.isArray(data.dailyNotes) ? data.dailyNotes.map(ensureDailyNoteShape) : [];
     next.notes = data.notes ? ensureNotesShape(data.notes) : notesFromLegacyDailyNotes(next.dailyNotes);
+    next.podcasts = ensurePodcastsShape(data.podcasts);
+    next.tiktok = ensureTikTokShape(data.tiktok);
+    next.marketing = ensureMarketingShape(data.marketing);
     next.dailies = ensureDailiesShape(data.dailies ? { ...data.dailies, createdAt: data.dailies.createdAt || next.createdAt } : { createdAt: next.createdAt });
     next.moodboard = ensureMoodboardShape(data.moodboard);
     next.drawing = ensureDrawingShape(data.drawing);
@@ -9280,6 +9906,9 @@ function loadProjectData(data, fp) {
     next.media = migrated.media.map(ensureMediaShape);
     next.dailyNotes = [];
     next.notes = ensureNotesShape({ blocks: [] });
+    next.podcasts = ensurePodcastsShape();
+    next.tiktok = ensureTikTokShape();
+    next.marketing = ensureMarketingShape();
     next.dailies = ensureDailiesShape({ createdAt: next.createdAt });
     next.moodboard = ensureMoodboardShape();
     next.drawing = ensureDrawingShape();
@@ -9894,12 +10523,22 @@ function initControls() {
       return;
     }
     if (e.key === 'Escape') {
+      if (V.typeFindQuery) {
+        V.typeFindQuery = '';
+        clearTypeFindHighlights();
+        e.preventDefault();
+        return;
+      }
       if ($('importance-menu') || $('milestone-menu') || $('category-menu') || $('album-lightbox') || $('task-notebook')) {
         closeImportanceMenu();
         closeMilestoneMenu();
         closeCategoryMenu();
         closeAlbumLightbox();
         closeTaskNotebook();
+        return;
+      }
+      if (goUpNotebookCategory()) {
+        e.preventDefault();
         return;
       }
       if (S.view === 'moodboard' && S.moodboard?.boardOpen && moodboardSelectionIds(getActiveMoodboard()).length) {
@@ -9920,6 +10559,7 @@ function initControls() {
       return;
     }
     if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
+    if (handleTypeFindKey(e)) return;
     const k = e.key.toLowerCase();
     if ((e.ctrlKey || e.metaKey) && k === 'z' && S.view === 'moodboard') {
       e.preventDefault();

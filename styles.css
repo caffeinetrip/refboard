@@ -228,6 +228,9 @@ body {
 
 .nav-subgroup {
   flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
   padding-top: 4px;
   border-top: 1px solid var(--line);
 }
@@ -488,6 +491,17 @@ body {
   gap: 12px;
 }
 
+.nested-category-grid {
+  margin-bottom: 14px;
+}
+
+.category-path {
+  margin-top: 6px;
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 500;
+}
+
 .category-card {
   min-height: 118px;
   display: flex;
@@ -532,6 +546,7 @@ body {
 
 .category-card-main {
   min-width: 0;
+  flex: 1 1 auto;
 }
 
 .category-card-title {
@@ -544,12 +559,32 @@ body {
   font-weight: 500;
 }
 
+.category-card-meta {
+  flex: 0 0 auto;
+  align-self: flex-start;
+}
+
+.category-card-meta .rarity-badge,
+.category-choice .rarity-badge {
+  cursor: default;
+}
+
 .category-action-row {
   display: flex;
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
   margin-bottom: 14px;
+}
+
+.category-sheet-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line);
 }
 
 .game-card {
@@ -939,6 +974,14 @@ body {
   background: var(--panel-3);
 }
 
+.category-importance-control {
+  width: 32px;
+  height: 38px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 .media-category-controls {
   margin: 0;
 }
@@ -973,7 +1016,7 @@ body {
   width: 100%;
   min-height: 38px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 10px;
   padding: 0 10px;
@@ -984,7 +1027,7 @@ body {
   text-align: left;
 }
 
-.category-choice span {
+.category-choice-title {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -1002,6 +1045,16 @@ body {
   border-color: rgba(127, 141, 163, .18);
   background: rgba(127, 141, 163, .075);
   color: var(--text);
+}
+
+.typefind-match {
+  border-color: rgba(245, 158, 11, .5) !important;
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, .16);
+}
+
+.typefind-current {
+  border-color: rgba(245, 158, 11, .9) !important;
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, .24);
 }
 
 .text-input:focus,
