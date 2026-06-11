@@ -3198,11 +3198,7 @@ function buildDailyExtraCard(day, quest, rerender) {
       <input class="daily-task-title-input daily-extra-title" value="${esc(quest.title || '')}">
       ${done ? '<span class="task-done-mark">Done</span>' : ''}
       <button class="mini-btn daily-extra-toggle">${done ? 'Return' : 'Done'}</button>
-    </div>
-    <textarea class="daily-task-notes daily-extra-notes" placeholder="Extra note...">${esc(quest.notes || '')}</textarea>
-    <div class="daily-task-foot">
-      <span>${done ? `done${quest.completedAt ? ` ${formatShortDate(quest.completedAt)}` : ''}` : 'extra'}</span>
-      <button class="mini-btn danger-lite daily-extra-delete">Delete</button>
+      <button class="mini-btn danger-lite daily-card-delete daily-extra-delete" title="Delete">x</button>
     </div>`;
   bindImportanceTriggers(card, () => quest.importance, value => {
     quest.importance = value;
@@ -3212,12 +3208,6 @@ function buildDailyExtraCard(day, quest, rerender) {
   });
   card.querySelector('.daily-extra-title').oninput = e => {
     quest.title = e.target.value;
-    quest.updatedAt = now();
-    touchDailyDay(day);
-    markDirty();
-  };
-  card.querySelector('.daily-extra-notes').oninput = e => {
-    quest.notes = e.target.value;
     quest.updatedAt = now();
     touchDailyDay(day);
     markDirty();
@@ -3459,12 +3449,12 @@ function renderDailyKanban(day, host, rerender) {
       <div class="kanban-column-head">
         <span>${esc(label)}</span>
         <span class="kanban-column-tools">
-          <button class="column-sort-btn" data-sort-daily="${esc(key)}">Sort</button>
+          <button class="column-sort-btn" data-sort-daily="${esc(key)}" title="Sort by importance">...</button>
           <span class="column-count">${quests.length}</span>
         </span>
       </div>
-      <button class="mini-add-task" data-add-daily="${esc(key)}">+ ${isExtra ? 'Extra' : 'Quest'}</button>
-      <div class="task-list" data-daily-column="${esc(key)}"></div>`;
+      <div class="task-list" data-daily-column="${esc(key)}"></div>
+      <button class="mini-add-task" data-add-daily="${esc(key)}">+ Add card</button>`;
 
     col.querySelector('[data-add-daily]').onclick = () => {
       if (isExtra) addDailyExtraQuestFlow(day, rerender);
@@ -3567,11 +3557,7 @@ function buildDailyQuestCard(day, columnKey, quest, rerender) {
       <input class="daily-task-title-input" value="${esc(quest.title || '')}">
       ${done ? '<span class="task-done-mark">Done</span>' : ''}
       <button class="mini-btn daily-complete-btn">${esc(actionLabel)}</button>
-    </div>
-    <textarea class="daily-task-notes" placeholder="Quest note...">${esc(quest.notes || '')}</textarea>
-    <div class="daily-task-foot">
-      <span>${done ? `done${quest.completedAt ? ` ${formatShortDate(quest.completedAt)}` : ''}` : quest.source === 'default' ? 'default' : 'manual'}</span>
-      <button class="mini-btn danger-lite daily-delete-quest">Delete</button>
+      <button class="mini-btn danger-lite daily-card-delete daily-delete-quest" title="Delete">x</button>
     </div>`;
   bindImportanceTriggers(card, () => quest.importance, value => {
     quest.importance = value;
@@ -3581,12 +3567,6 @@ function buildDailyQuestCard(day, columnKey, quest, rerender) {
   });
   card.querySelector('.daily-task-title-input').oninput = e => {
     quest.title = e.target.value;
-    quest.updatedAt = now();
-    touchDailyDay(day);
-    markDirty();
-  };
-  card.querySelector('.daily-task-notes').oninput = e => {
-    quest.notes = e.target.value;
     quest.updatedAt = now();
     touchDailyDay(day);
     markDirty();
@@ -9681,8 +9661,8 @@ function initControls() {
     if (cb) cb(value);
   };
   $('modal-inp').addEventListener('keydown', e => {
-    if (e.key === 'Enter') $('modal-ok').click();
-    if (e.key === 'Escape') closeModal();
+    if (e.key === 'Enter') { $('modal-ok').click(); e.stopPropagation(); }
+    if (e.key === 'Escape') { closeModal(); e.stopPropagation(); }
   });
 
   $('pb-play').onclick = () => {
