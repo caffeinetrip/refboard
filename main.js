@@ -4,8 +4,10 @@ const path = require('path');
 const fs = require('fs');
 
 let mainWindow = null;
+let allowClose = false;
 
 function createWindow() {
+  allowClose = false;
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -20,6 +22,11 @@ function createWindow() {
     },
   });
   mainWindow.loadFile('index.html');
+  mainWindow.on('close', event => {
+    if (allowClose) return;
+    event.preventDefault();
+    mainWindow.webContents.send('app:request-close');
+  });
   mainWindow.on('closed', () => { mainWindow = null; });
 }
 
@@ -68,6 +75,40 @@ ipcMain.handle('dialog:openProject', async () => {
 
 ipcMain.handle('fs:write', (_, fp, data) => { fs.writeFileSync(fp, data, 'utf8'); return true; });
 ipcMain.handle('fs:read',  (_, fp) => fs.readFileSync(fp, 'utf8'));
+
+ipcMain.on('dialog:confirmSync', (event, message) => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  const choice = dialog.showMessageBoxSync(win || undefined, {
+    type: 'question',
+    buttons: ['Cancel', 'OK'],
+    defaultId: 1,
+    cancelId: 0,
+    noLink: true,
+    title: 'Confirm',
+    message: String(message || 'Are you sure?'),
+  });
+  if (win) {
+    win.focus();
+    event.sender.focus();
+  }
+  event.returnValue = choice === 1;
+});
+
+ipcMain.handle('win:focus', event => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  if (!win) return false;
+  win.focus();
+  event.sender.focus();
+  return true;
+});
+
+ipcMain.handle('win:close-approved', event => {
+  const win = BrowserWindow.fromWebContents(event.sender) || mainWindow;
+  if (!win) return false;
+  allowClose = true;
+  win.close();
+  return true;
+});
 
 ipcMain.handle('win:minimize', () => BrowserWindow.getFocusedWindow()?.minimize());
 ipcMain.handle('win:maximize', () => {

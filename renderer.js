@@ -18,6 +18,7 @@ try {
 
 const APP_VERSION = 8;
 const APP_TYPE = 'game-analysis-library';
+const LAST_PROJECT_KEY = 'refboard:lastProjectPath';
 const DAILIES_EPOCH = '2026-06-07';
 const MOODBOARD_WORLD_MARGIN = 90000;
 const MOODBOARD_WORLD_MIN_WIDTH = 240000;
@@ -34,6 +35,28 @@ const esc = value => String(value ?? '')
 
 const SESSION_CACHE_DIR = nodePath.join(os.tmpdir(), 'refboard-analysis-' + process.pid);
 try { fs.mkdirSync(SESSION_CACHE_DIR, { recursive: true }); } catch (e) {}
+
+const nativeConfirm = window.confirm.bind(window);
+
+function repairAppFocus() {
+  try { window.focus(); } catch (e) {}
+  try { ipcRenderer.invoke('win:focus').catch(() => {}); } catch (e) {}
+  setTimeout(() => {
+    try { window.focus(); } catch (e) {}
+    try { ipcRenderer.invoke('win:focus').catch(() => {}); } catch (e) {}
+  }, 30);
+}
+
+window.confirm = message => {
+  let result;
+  try {
+    result = ipcRenderer.sendSync('dialog:confirmSync', String(message || 'Are you sure?'));
+  } catch (e) {
+    result = nativeConfirm(message);
+  }
+  repairAppFocus();
+  return !!result;
+};
 
 function sessionCacheKey(fp) {
   return crypto.createHash('md5').update(fp).digest('hex');
@@ -167,6 +190,7 @@ let V = {
 let activeGifCache = null;
 let toastTimer = null;
 let modalCb = null;
+let closePromptOpen = false;
 let importanceMenuCloseHandler = null;
 let milestoneMenuCloseHandler = null;
 let categoryMenuCloseHandler = null;
@@ -2239,20 +2263,144 @@ function hideLoading() {
 }
 
 function askText(title, value, okLabel, cb) {
+  closeImportanceMenu();
+  closeCategoryMenu();
+  closeMilestoneMenu();
   $('modal-title').textContent = title;
   $('modal-inp').value = value || '';
   $('modal-ok').textContent = okLabel || 'OK';
   modalCb = cb;
   $('modal-bg').classList.remove('hidden');
-  setTimeout(() => {
-    $('modal-inp').focus();
-    $('modal-inp').select();
-  }, 0);
+  focusTextModalInput();
+}
+
+function focusTextModalInput() {
+  const input = $('modal-inp');
+  const initialValue = input.value;
+  const focus = () => {
+    repairAppFocus();
+    input.focus();
+    if (input.value === initialValue) input.select();
+  };
+  focus();
+  requestAnimationFrame(focus);
+  setTimeout(focus, 50);
+}
+
+function routeKeyToTextModalInput(e) {
+  const input = $('modal-inp');
+  if (!input || document.activeElement === input) return false;
+  if (e.ctrlKey || e.metaKey || e.altKey) {
+    focusTextModalInput();
+    return false;
+  }
+  focusTextModalInput();
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? start;
+  if (e.key && e.key.length === 1) {
+    input.setRangeText(e.key, start, end, 'end');
+    e.preventDefault();
+    e.stopPropagation();
+    return true;
+  }
+  if (e.key === 'Backspace' && (start > 0 || end > start)) {
+    input.setRangeText('', end > start ? start : start - 1, end, 'end');
+    e.preventDefault();
+    e.stopPropagation();
+    return true;
+  }
+  if (e.key === 'Delete' && (end > start || start < input.value.length)) {
+    input.setRangeText('', start, end > start ? end : start + 1, 'end');
+    e.preventDefault();
+    e.stopPropagation();
+    return true;
+  }
+  return false;
 }
 
 function closeModal() {
   $('modal-bg').classList.add('hidden');
   modalCb = null;
+}
+
+function closePromptCopy() {
+  const name = S.projectName || 'Untitled';
+  const canSave = !!S.projectPath;
+  return {
+    title: 'Save changes before closing?',
+    text: `Your latest changes to "${name}" are not saved.`,
+    primary: canSave ? 'Save & Exit' : 'Save As...',
+    secondary: "Don't Save",
+    cancel: 'Cancel',
+  };
+}
+
+function showClosePrompt() {
+  if (closePromptOpen) return Promise.resolve('cancel');
+  closePromptOpen = true;
+  closeImportanceMenu();
+  closeCategoryMenu();
+  closeMilestoneMenu();
+  closeModal();
+  const copy = closePromptCopy();
+  const old = $('close-prompt');
+  if (old) old.remove();
+  const prompt = document.createElement('div');
+  prompt.id = 'close-prompt';
+  prompt.className = 'close-prompt';
+  prompt.innerHTML = `
+    <div class="close-prompt-box" role="dialog" aria-modal="true" aria-labelledby="close-prompt-title">
+      <div class="close-prompt-mark">R</div>
+      <div class="close-prompt-main">
+        <div class="close-prompt-eyebrow">RefBoard</div>
+        <h2 id="close-prompt-title">${esc(copy.title)}</h2>
+        <p>${esc(copy.text)}</p>
+        <div class="close-prompt-actions">
+          <button class="mb-btn accent" data-close-choice="save">${esc(copy.primary)}</button>
+          <button class="mb-btn" data-close-choice="discard">${esc(copy.secondary)}</button>
+          <button class="mb-btn" data-close-choice="cancel">${esc(copy.cancel)}</button>
+        </div>
+      </div>
+    </div>`;
+  document.body.appendChild(prompt);
+  return new Promise(resolve => {
+    const finish = choice => {
+      prompt.remove();
+      closePromptOpen = false;
+      document.removeEventListener('keydown', onKeyDown, true);
+      resolve(choice);
+    };
+    const onKeyDown = e => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        finish('cancel');
+      }
+    };
+    prompt.querySelectorAll('[data-close-choice]').forEach(btn => {
+      btn.onclick = () => finish(btn.dataset.closeChoice || 'cancel');
+    });
+    document.addEventListener('keydown', onKeyDown, true);
+    prompt.querySelector('[data-close-choice="save"]')?.focus();
+  });
+}
+
+async function requestAppClose() {
+  if (closePromptOpen) return;
+  if (!S.modified) {
+    ipcRenderer.invoke('win:close-approved');
+    return;
+  }
+  const choice = await showClosePrompt();
+  if (choice === 'cancel') return;
+  if (choice === 'discard') {
+    S.modified = false;
+    ipcRenderer.invoke('win:close-approved');
+    return;
+  }
+  if (choice === 'save') {
+    const saved = S.projectPath ? doSave(S.projectPath) : await saveAsProject();
+    if (saved) ipcRenderer.invoke('win:close-approved');
+  }
 }
 
 function returnToViewRoot(view) {
@@ -9015,6 +9163,22 @@ function fileUrl(fp) {
   catch (e) { return ''; }
 }
 
+function rememberLastProjectPath(fp) {
+  if (!fp) return;
+  try { localStorage.setItem(LAST_PROJECT_KEY, fp); } catch (e) {}
+}
+
+function forgetLastProjectPath(fp = null) {
+  try {
+    if (!fp || localStorage.getItem(LAST_PROJECT_KEY) === fp) localStorage.removeItem(LAST_PROJECT_KEY);
+  } catch (e) {}
+}
+
+function getLastProjectPath() {
+  try { return localStorage.getItem(LAST_PROJECT_KEY) || ''; }
+  catch (e) { return ''; }
+}
+
 function serializeProject() {
   ensureWorkspaceShape();
   return {
@@ -9043,6 +9207,31 @@ function newProject() {
   toast('New library');
 }
 
+function loadProjectFile(fp, options = {}) {
+  if (!fp || !fs.existsSync(fp)) {
+    forgetLastProjectPath(fp);
+    if (options.toast !== false) toast('Project file not found');
+    return Promise.resolve(false);
+  }
+  showLoading(options.loadingText || 'Opening...');
+  return new Promise(resolve => {
+    setTimeout(() => {
+      try {
+        const data = JSON.parse(fs.readFileSync(fp, 'utf8'));
+        loadProjectData(data, fp);
+        hideLoading();
+        if (options.toast !== false) toast(options.toastText || 'Opened');
+        resolve(true);
+      } catch (e) {
+        hideLoading();
+        if (options.clearBadPath !== false) forgetLastProjectPath(fp);
+        if (options.toast !== false) toast('Could not open');
+        resolve(false);
+      }
+    }, 30);
+  });
+}
+
 async function openProject() {
   if (S.modified && !confirm('Discard unsaved changes?')) return;
   const result = await ipcRenderer.invoke('dialog:open', {
@@ -9051,19 +9240,7 @@ async function openProject() {
     properties: ['openFile'],
   });
   if (result.canceled || !result.filePaths?.length) return;
-  const fp = result.filePaths[0];
-  showLoading('Opening...');
-  setTimeout(() => {
-    try {
-      const data = JSON.parse(fs.readFileSync(fp, 'utf8'));
-      loadProjectData(data, fp);
-      hideLoading();
-      toast('Opened');
-    } catch (e) {
-      hideLoading();
-      toast('Could not open');
-    }
-  }, 30);
+  return loadProjectFile(result.filePaths[0]);
 }
 
 function detectProjectCreatedAt(data, fp) {
@@ -9125,6 +9302,7 @@ function loadProjectData(data, fp) {
   next.activeMoodboardId = next.moodboard?.activeBoardId || null;
   S = next;
   navStack = [];
+  rememberLastProjectPath(fp);
   renderApp();
 }
 
@@ -9176,12 +9354,11 @@ function migrateV1ToV2(data, projectName) {
   return { questionTemplates: [], games: [game], media };
 }
 
-function saveProject() {
+async function saveProject() {
   if (!S.projectPath) {
-    saveAsProject();
-    return;
+    return saveAsProject();
   }
-  doSave(S.projectPath);
+  return doSave(S.projectPath);
 }
 
 async function saveAsProject() {
@@ -9190,8 +9367,8 @@ async function saveAsProject() {
     defaultPath: S.projectName + '.refboard',
     filters: [{ name: 'RefBoard', extensions: ['refboard'] }],
   });
-  if (result.canceled || !result.filePath) return;
-  doSave(result.filePath);
+  if (result.canceled || !result.filePath) return false;
+  return doSave(result.filePath);
 }
 
 function doSave(fp) {
@@ -9201,10 +9378,13 @@ function doSave(fp) {
     ensureAllMediaCopied();
     fs.writeFileSync(fp, JSON.stringify(serializeProject(), null, 2), 'utf8');
     S.modified = false;
+    rememberLastProjectPath(fp);
     updateChrome();
     toast('Saved');
+    return true;
   } catch (e) {
     toast('Could not save');
+    return false;
   }
 }
 
@@ -9647,10 +9827,8 @@ function initControls() {
   $('btn-saveas').onclick = saveAsProject;
   $('btn-min').onclick = () => ipcRenderer.invoke('win:minimize');
   $('btn-max').onclick = () => ipcRenderer.invoke('win:maximize');
-  $('btn-close').onclick = () => {
-    if (S.modified && !confirm('Discard unsaved changes?')) return;
-    ipcRenderer.invoke('win:close');
-  };
+  $('btn-close').onclick = requestAppClose;
+  ipcRenderer.on('app:request-close', requestAppClose);
 
   $('modal-cancel').onclick = closeModal;
   $('modal-ok').onclick = () => {
@@ -9707,11 +9885,15 @@ function initControls() {
   });
 
   document.addEventListener('keydown', e => {
+    if (closePromptOpen) return;
+    const textModalOpen = !$('modal-bg').classList.contains('hidden');
+    if (textModalOpen) {
+      if (e.key === 'Escape') closeModal();
+      else if (e.key === 'Enter' && document.activeElement !== $('modal-inp')) $('modal-ok').click();
+      else routeKeyToTextModalInput(e);
+      return;
+    }
     if (e.key === 'Escape') {
-      if (!$('modal-bg').classList.contains('hidden')) {
-        closeModal();
-        return;
-      }
       if ($('importance-menu') || $('milestone-menu') || $('category-menu') || $('album-lightbox') || $('task-notebook')) {
         closeImportanceMenu();
         closeMilestoneMenu();
@@ -9850,5 +10032,16 @@ function formatShortDate(value) {
   }
 }
 
+function loadLastProjectOnStartup() {
+  const fp = getLastProjectPath();
+  if (!fp) return;
+  loadProjectFile(fp, {
+    loadingText: 'Opening last project...',
+    toastText: 'Restored last project',
+    toast: true,
+  });
+}
+
 initControls();
 renderApp();
+loadLastProjectOnStartup();
